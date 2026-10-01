@@ -1,0 +1,2216 @@
+name: My Summer Car 2021 Mobile iOS - v1 NFS-Style Recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recover_and_export:
+    name: 1. Recover APK, repair project, export iOS
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    env:
+      UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+      UNITY_EMAIL: ${{ secrets.UNITY_USERNAME }}
+
+      SOURCE_UNITY: "2017.3.0f3"
+      SOURCE_CHANGESET: "a9f86dcd79df"
+
+      MIGRATION_UNITY: "2017.4.40f1"
+      MIGRATION_CHANGESET: "6e14067f8a9a"
+
+      BUILD_UNITY: "2019.4.40f1"
+      BUILD_CHANGESET: "ffc62b691db5"
+
+      EXPECTED_APK: "MSC2021Mobile.apk"
+      EXPECTED_SHA256: "fbacd518ec0587a5797ee7ed539874b43338fe5c7982fbcadfa120917bc38590"
+
+      WORK: ${{ github.workspace }}/msc-work
+      APK: ${{ github.workspace }}/msc-work/MSC2021Mobile.apk
+      APKROOT: ${{ github.workspace }}/msc-work/apk
+      RECOVERED: ${{ github.workspace }}/msc-work/recovered
+      OUTPUT: ${{ github.workspace }}/msc-output
+      XCODE_OUT: ${{ github.workspace }}/msc-build/iOS/MSC2021Mobile-iOS
+
+    outputs:
+      xcode_ready: ${{ steps.detect_xcode.outputs.ready }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Prepare folders
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf \
+            "$WORK" \
+            "$OUTPUT" \
+            "$GITHUB_WORKSPACE/msc-build"
+
+          mkdir -p \
+            "$WORK" \
+            "$APKROOT" \
+            "$RECOVERED" \
+            "$OUTPUT" \
+            "$GITHUB_WORKSPACE/msc-build/iOS"
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -o Acquire::Retries=4
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates \
+            curl \
+            git \
+            gnupg \
+            jq \
+            p7zip-full \
+            unzip \
+            xz-utils \
+            zip \
+            xvfb \
+            libgconf-2-4 \
+            libgtk2.0-0 \
+            libgtk-3-0 \
+            libnss3 \
+            libasound2 \
+            libglu1-mesa \
+            libxss1 \
+            libxtst6 \
+            libxrandr2 \
+            libxcursor1 \
+            libxi6 \
+            libxinerama1 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libdrm2 \
+            libgbm1
+
+      - name: Find MSC APK in repository or Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          FOUND=""
+
+          echo "===== SEARCH REPOSITORY ====="
+
+          FOUND="$(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -iname "$EXPECTED_APK" \
+              ! -path "$WORK/*" \
+              -print \
+              | head -1
+          )"
+
+          if [ -z "$FOUND" ]; then
+            FOUND="$(
+              find "$GITHUB_WORKSPACE" \
+                -type f \
+                -iname '*.apk' \
+                ! -path "$WORK/*" \
+                -printf '%s %p\n' \
+                | sort -nr \
+                | head -1 \
+                | cut -d' ' -f2-
+            )"
+          fi
+
+          if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
+            if head -c 200 "$FOUND" 2>/dev/null | grep -q 'git-lfs.github.com/spec'; then
+              echo "APK is a Git LFS pointer, pulling LFS..."
+              git lfs install --local || true
+              git lfs pull || true
+            fi
+
+            if [ -s "$FOUND" ] && \
+               ! head -c 200 "$FOUND" 2>/dev/null | grep -q 'git-lfs.github.com/spec'; then
+              cp "$FOUND" "$APK"
+            fi
+          fi
+
+          if [ ! -s "$APK" ]; then
+            echo "===== SEARCH GITHUB RELEASES ====="
+
+            TAGS="$(
+              gh release list \
+                --repo "$GITHUB_REPOSITORY" \
+                --limit 100 \
+                --json tagName \
+                --jq '.[].tagName' \
+                2>/dev/null || true
+            )"
+
+            for TAG in $TAGS; do
+              rm -rf "$WORK/release-one"
+              mkdir -p "$WORK/release-one"
+
+              gh release download "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$EXPECTED_APK" \
+                --dir "$WORK/release-one" \
+                2>/dev/null || true
+
+              CANDIDATE="$WORK/release-one/$EXPECTED_APK"
+
+              if [ ! -s "$CANDIDATE" ]; then
+                rm -rf "$WORK/release-one"
+                mkdir -p "$WORK/release-one"
+
+                gh release download "$TAG" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --pattern '*.apk' \
+                  --dir "$WORK/release-one" \
+                  2>/dev/null || true
+
+                CANDIDATE="$(
+                  find "$WORK/release-one" \
+                    -type f \
+                    -iname '*.apk' \
+                    -printf '%s %p\n' \
+                    | sort -nr \
+                    | head -1 \
+                    | cut -d' ' -f2-
+                )"
+              fi
+
+              if [ -n "${CANDIDATE:-}" ] && [ -s "$CANDIDATE" ]; then
+                cp "$CANDIDATE" "$APK"
+                break
+              fi
+            done
+          fi
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::$EXPECTED_APK not found."
+            echo "Put the APK in a GitHub Release asset. The workflow will download it automatically."
+            exit 1
+          fi
+
+          echo "===== APK FOUND ====="
+          ls -lh "$APK"
+
+          ACTUAL_SHA="$(sha256sum "$APK" | awk '{print $1}')"
+          echo "SHA256=$ACTUAL_SHA"
+
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA256" ]; then
+            echo "::error::APK SHA256 does not match the MSC2021Mobile.apk that was checked before this workflow."
+            echo "Expected: $EXPECTED_SHA256"
+            echo "Actual:   $ACTUAL_SHA"
+            exit 1
+          fi
+
+      - name: Verify Unity 2017.3 Mono base
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$APKROOT"
+          mkdir -p "$APKROOT"
+
+          unzip -oq "$APK" -d "$APKROOT"
+
+          DATA="$APKROOT/assets/bin/Data"
+          ASM="$DATA/Managed/Assembly-CSharp.dll"
+
+          test -s "$DATA/data.unity3d"
+          test -s "$ASM"
+
+          VERSION="$(
+            strings "$DATA/data.unity3d" \
+              | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+[abfp][0-9]+' \
+              | head -1
+          )"
+
+          echo "Detected Unity: $VERSION"
+
+          if [ "$VERSION" != "$SOURCE_UNITY" ]; then
+            echo "::error::Expected Unity $SOURCE_UNITY, got ${VERSION:-unknown}"
+            exit 1
+          fi
+
+          if find "$APKROOT" -type f -name 'libil2cpp.so' | grep -q .; then
+            echo "::error::This APK is IL2CPP. Expected the checked Mono build."
+            exit 1
+          fi
+
+          if ! find "$APKROOT" -type f -name 'libmono.so' | grep -q .; then
+            echo "::error::libmono.so was not found."
+            exit 1
+          fi
+
+          EXTRA_NATIVE="$(
+            find "$APKROOT/lib" \
+              -type f \
+              -name '*.so' \
+              -printf '%f\n' \
+              | sort -u \
+              | grep -Ev '^(libmain\.so|libmono\.so|libunity\.so)$' \
+              || true
+          )"
+
+          if [ -n "$EXTRA_NATIVE" ]; then
+            echo "::error::Unexpected Android-only native libraries were found:"
+            echo "$EXTRA_NATIVE"
+            exit 1
+          fi
+
+          {
+            echo "APK=$EXPECTED_APK"
+            echo "APK_SIZE=$(stat -c%s "$APK")"
+            echo "APK_SHA256=$(sha256sum "$APK" | awk '{print $1}')"
+            echo "SOURCE_UNITY=$VERSION"
+            echo "ASSEMBLY_CSHARP_SIZE=$(stat -c%s "$ASM")"
+            echo
+            echo "ARCHITECTURES:"
+            find "$APKROOT/lib" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -printf '%f\n' \
+              | sort
+            echo
+            echo "NATIVE_LIBRARIES:"
+            find "$APKROOT/lib" \
+              -type f \
+              -name '*.so' \
+              -printf '%P  %s bytes\n' \
+              | sort
+            echo
+            echo "MANAGED_DLLS:"
+            find "$DATA/Managed" \
+              -type f \
+              -name '*.dll' \
+              -printf '%f  %s bytes\n' \
+              | sort
+          } | tee "$OUTPUT/apk-summary.txt"
+
+      - name: Extract original APK icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ICON="$(
+            find "$APKROOT/res" \
+              -type f \
+              -name 'app_icon.png' \
+              -printf '%s %p\n' \
+              | sort -nr \
+              | head -1 \
+              | cut -d' ' -f2-
+          )"
+
+          if [ -z "$ICON" ] || [ ! -s "$ICON" ]; then
+            echo "::error::Original app_icon.png was not found."
+            exit 1
+          fi
+
+          cp "$ICON" "$OUTPUT/MSC2021-original-icon.png"
+
+          file "$OUTPUT/MSC2021-original-icon.png"
+          ls -lh "$OUTPUT/MSC2021-original-icon.png"
+
+      - name: Download AssetRipper 2.0.0
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$WORK/tools/assetripper"
+
+          gh release download 2.0.0 \
+            -R AssetRipper/AssetRipper \
+            -p 'AssetRipper_linux_x64.tar.xz' \
+            -D "$WORK/tools"
+
+          tar -xJf \
+            "$WORK/tools/AssetRipper_linux_x64.tar.xz" \
+            -C "$WORK/tools/assetripper"
+
+          RIPPER="$(
+            find "$WORK/tools/assetripper" \
+              -type f \
+              \( \
+                -name 'AssetRipper.GUI.Free' \
+                -o -name 'AssetRipper.GUI' \
+                -o -name 'AssetRipper' \
+              \) \
+              -print \
+              | head -1
+          )"
+
+          if [ -z "$RIPPER" ]; then
+            echo "::error::AssetRipper executable was not found."
+            exit 1
+          fi
+
+          chmod +x "$RIPPER"
+          echo "RIPPER=$RIPPER" >> "$GITHUB_ENV"
+
+      - name: Recover editable Unity project
+        id: recover
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PORT=3333
+          EXPORT="$RECOVERED/MSC2021Mobile"
+
+          mkdir -p "$EXPORT"
+
+          "$RIPPER" \
+            --headless \
+            --port "$PORT" \
+            > "$OUTPUT/assetripper.log" 2>&1 &
+
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
+
+          READY=0
+
+          for i in $(seq 1 120); do
+            if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::AssetRipper did not start."
+            tail -300 "$OUTPUT/assetripper.log" || true
+            exit 1
+          fi
+
+          LOAD_CODE="$(
+            curl -sS \
+              -o "$OUTPUT/assetripper-load-response.txt" \
+              -w '%{http_code}' \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "Path=$APKROOT" \
+              "http://127.0.0.1:${PORT}/LoadFolder"
+          )"
+
+          echo "LOAD_HTTP=$LOAD_CODE"
+
+          if [ "$LOAD_CODE" != "200" ] && [ "$LOAD_CODE" != "302" ]; then
+            echo "::error::AssetRipper LoadFolder failed."
+            cat "$OUTPUT/assetripper-load-response.txt" || true
+            exit 1
+          fi
+
+          EXPORT_CODE="$(
+            curl -sS \
+              -o "$OUTPUT/assetripper-export-response.txt" \
+              -w '%{http_code}' \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "Path=$EXPORT" \
+              --data-urlencode 'CreateSubfolder=false' \
+              "http://127.0.0.1:${PORT}/Export/UnityProject"
+          )"
+
+          echo "EXPORT_HTTP=$EXPORT_CODE"
+
+          kill "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+          trap - EXIT
+
+          if [ "$EXPORT_CODE" != "200" ] && [ "$EXPORT_CODE" != "302" ]; then
+            echo "::error::AssetRipper Unity project export failed."
+            cat "$OUTPUT/assetripper-export-response.txt" || true
+            tail -500 "$OUTPUT/assetripper.log" || true
+            exit 1
+          fi
+
+          PROJECT=""
+
+          if [ -d "$EXPORT/ExportedProject/Assets" ]; then
+            PROJECT="$EXPORT/ExportedProject"
+          elif [ -d "$EXPORT/Assets" ]; then
+            PROJECT="$EXPORT"
+          else
+            PROJECT="$(
+              find "$EXPORT" \
+                -type d \
+                -name Assets \
+                -print \
+                | head -1 \
+                | xargs -r dirname
+            )"
+          fi
+
+          if [ -z "$PROJECT" ] || [ ! -d "$PROJECT/Assets" ]; then
+            echo "::error::Recovered Unity project was not found."
+            find "$EXPORT" -maxdepth 5 -type d | head -300
+            exit 1
+          fi
+
+          PROJECT="$(realpath "$PROJECT")"
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+
+          {
+            echo "RECOVERED_PROJECT=$PROJECT"
+            echo "SCENES=$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l | tr -d ' ')"
+            echo "CS_FILES=$(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l | tr -d ' ')"
+            echo "DLLS=$(find "$PROJECT/Assets" -type f -name '*.dll' | wc -l | tr -d ' ')"
+            echo "MATERIALS=$(find "$PROJECT/Assets" -type f -name '*.mat' | wc -l | tr -d ' ')"
+            echo "SHADERS=$(find "$PROJECT/Assets" -type f -name '*.shader' | wc -l | tr -d ' ')"
+            echo
+            echo "SCENES:"
+            find "$PROJECT/Assets" -type f -name '*.unity' | sort
+          } | tee "$OUTPUT/recovery-summary.txt"
+
+      - name: Audit and rename AssetRipper dummy shaders
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+          export PROJECT
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT"])
+          assets = project / "Assets"
+          out = Path(os.environ["OUTPUT"])
+
+          shader_files = list(assets.rglob("*.shader"))
+          dummy = []
+          renamed = []
+
+          shader_decl = re.compile(r'Shader\s+"([^"]+)"')
+
+          for p in shader_files:
+              s = p.read_text(encoding="utf-8", errors="replace")
+
+              if "DummyShaderTextExporter" not in s:
+                  continue
+
+              m = shader_decl.search(s)
+              old_name = m.group(1) if m else p.stem
+              dummy.append((p, old_name))
+
+              if m and not old_name.startswith("RecoveredDummy/"):
+                  new_name = "RecoveredDummy/" + old_name
+                  s = s[:m.start(1)] + new_name + s[m.end(1):]
+                  p.write_text(s, encoding="utf-8")
+                  renamed.append((p, old_name, new_name))
+
+          report = []
+          report.append(f"TOTAL_SHADER_FILES={len(shader_files)}")
+          report.append(f"DUMMY_SHADER_FILES={len(dummy)}")
+          report.append(f"RENAMED_DUMMY_SHADERS={len(renamed)}")
+          report.append("")
+          report.append("DUMMY_SHADERS:")
+
+          for p, name in dummy:
+              report.append(f"{p.relative_to(project)} :: {name}")
+
+          (out / "shader-audit.txt").write_text(
+              "\n".join(report) + "\n",
+              encoding="utf-8"
+          )
+
+          print("\n".join(report[:20]))
+
+          if len(shader_files) > 0 and len(dummy) == len(shader_files):
+              print("WARNING: every exported .shader file is an AssetRipper dummy.")
+              print("The workflow will repair common Standard/Mobile/Legacy/UI/Particle materials in Unity before export.")
+          PY
+
+      - name: Prepare recovered project for Unity migration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+          export PROJECT
+
+          echo "===== REMOVE ANDROID-ONLY PLUGIN FILES ====="
+
+          find "$PROJECT/Assets" \
+            -type f \
+            \( \
+              -iname '*.so' \
+              -o -iname '*.aar' \
+              -o -iname '*.jar' \
+              -o -iname '*.apk' \
+            \) \
+            -print \
+            | tee "$OUTPUT/removed-android-files.txt" \
+            || true
+
+          find "$PROJECT/Assets" \
+            -type f \
+            \( \
+              -iname '*.so' \
+              -o -iname '*.aar' \
+              -o -iname '*.jar' \
+              -o -iname '*.apk' \
+            \) \
+            -delete \
+            || true
+
+          rm -rf "$PROJECT/Assets/Plugins/Android" || true
+
+          echo "===== REMOVE RECOVERED UNITY/BCL DLL COPIES ====="
+
+          python3 - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT"])
+          assets = project / "Assets"
+
+          exact_names = {
+              "mscorlib.dll",
+              "System.dll",
+              "System.Core.dll",
+              "System.Xml.dll",
+              "System.Xml.Linq.dll",
+              "System.Configuration.dll",
+              "System.Runtime.Serialization.dll",
+              "System.Security.dll",
+              "Mono.Security.dll",
+              "Mono.Posix.dll",
+              "Boo.Lang.dll",
+              "UnityScript.Lang.dll",
+          }
+
+          moved_root = project.parent / "removed-runtime-dlls"
+
+          for p in list(assets.rglob("*.dll")):
+              if p.name.startswith("UnityEngine.") or p.name == "UnityEngine.dll" or p.name in exact_names:
+                  rel = p.relative_to(assets)
+                  dst = moved_root / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.move(str(p), str(dst))
+
+                  meta = Path(str(p) + ".meta")
+
+                  if meta.exists():
+                      shutil.move(str(meta), str(dst) + ".meta")
+
+                  print("moved", rel)
+          PY
+
+          mkdir -p \
+            "$PROJECT/Assets/MSC2021iOS/Editor"
+
+          cp \
+            "$OUTPUT/MSC2021-original-icon.png" \
+            "$PROJECT/Assets/MSC2021iOS/app_icon.png"
+
+          cat > "$PROJECT/ProjectSettings/ProjectVersion.txt" <<'EOF'
+          m_EditorVersion: 2017.4.40f1
+          m_EditorVersionWithRevision: 2017.4.40f1 (6e14067f8a9a)
+          EOF
+
+          echo "===== PATCH COMMON OLD UNITY APIS ====="
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT"])
+          assets = project / "Assets"
+          changed = []
+
+          for p in assets.rglob("*.cs"):
+              s = p.read_text(encoding="utf-8", errors="replace")
+              old = s
+
+              s = re.sub(
+                  r'^\s*using\s+UnityScript(?:\.[A-Za-z_][A-Za-z0-9_.]*)?\s*;\s*$',
+                  '',
+                  s,
+                  flags=re.M
+              )
+
+              s = re.sub(r'\bGUIText\b', 'UnityEngine.UI.Text', s)
+              s = re.sub(r'\bGUITexture\b', 'UnityEngine.UI.RawImage', s)
+
+              s = s.replace(
+                  'Graphics.DrawProceduralIndirect(',
+                  'Graphics.DrawProceduralIndirectNow('
+              )
+
+              s = s.replace(
+                  'ComputeBufferType.DrawIndirect',
+                  'ComputeBufferType.IndirectArguments'
+              )
+
+              s = s.replace(
+                  'Application.LoadLevelAsync(',
+                  'UnityEngine.SceneManagement.SceneManager.LoadSceneAsync('
+              )
+
+              s = s.replace(
+                  'Application.LoadLevel(',
+                  'UnityEngine.SceneManagement.SceneManager.LoadScene('
+              )
+
+              s = s.replace(
+                  'Application.loadedLevelName',
+                  'UnityEngine.SceneManagement.SceneManager.GetActiveScene().name'
+              )
+
+              s = s.replace(
+                  'Application.loadedLevel',
+                  'UnityEngine.SceneManagement.SceneManager.GetActiveScene().buildIndex'
+              )
+
+              s = re.sub(
+                  r'(?<![A-Za-z0-9_\.])([A-Za-z_][A-Za-z0-9_]*)\.hdr\b',
+                  r'\1.allowHDR',
+                  s
+              )
+
+              s = re.sub(
+                  r'\bParticleRenderer\b',
+                  'ParticleSystemRenderer',
+                  s
+              )
+
+              if s != old:
+                  p.write_text(s, encoding="utf-8")
+                  changed.append(str(p.relative_to(project)))
+
+          out = Path(os.environ["OUTPUT"])
+          (out / "legacy-api-patched.txt").write_text(
+              "\n".join(changed) + ("\n" if changed else ""),
+              encoding="utf-8"
+          )
+
+          print("Patched C# files:", len(changed))
+          PY
+
+      - name: Setup Node 22 and Unity licensing helper
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Unity Hub and activation helper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm install -g @rage-against-the-pixel/unity-cli
+
+          sudo install -d -m 0755 /etc/apt/keyrings
+
+          curl -fsSL \
+            https://hub.unity3d.com/linux/keys/public \
+            | sudo gpg --dearmor \
+              -o /etc/apt/keyrings/unityhub.gpg
+
+          echo \
+            "deb [arch=amd64 signed-by=/etc/apt/keyrings/unityhub.gpg] https://hub.unity3d.com/linux/repos/deb stable main" \
+            | sudo tee \
+              /etc/apt/sources.list.d/unityhub.list \
+              >/dev/null
+
+          sudo apt-get update -o Acquire::Retries=4 || true
+          sudo apt-get install -y unityhub
+
+          HUB_CMD="$(command -v unityhub)"
+
+          sudo mkdir -p /opt/unityhub
+
+          sudo tee /opt/unityhub/unityhub >/dev/null <<EOF
+          #!/bin/bash
+          exec xvfb-run -a "$HUB_CMD" --no-sandbox --headless "\$@"
+          EOF
+
+          sudo chmod +x /opt/unityhub/unityhub
+
+          echo "UNITY_HUB_PATH=/opt/unityhub/unityhub" >> "$GITHUB_ENV"
+          echo "/opt/unityhub" >> "$GITHUB_PATH"
+
+      - name: Check Unity credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -n "${UNITY_USERNAME:-}" || {
+            echo "::error::UNITY_USERNAME repository secret is missing."
+            exit 1
+          }
+
+          test -n "${UNITY_PASSWORD:-}" || {
+            echo "::error::UNITY_PASSWORD repository secret is missing."
+            exit 1
+          }
+
+          echo "Unity credentials are present."
+
+      - name: Activate Unity Personal
+        shell: bash
+        env:
+          UNITY_HUB_PATH: /opt/unityhub/unityhub
+        run: |
+          set -euo pipefail
+
+          CLIENT="$(
+            find /usr /opt "$HOME" \
+              -type f \
+              -name 'Unity.Licensing.Client' \
+              2>/dev/null \
+              | head -1
+          )"
+
+          if [ -n "${CLIENT:-}" ]; then
+            CLIENT_DIR="$(dirname "$CLIENT")"
+
+            sudo rm -rf /opt/unityhub/UnityLicensingClient
+            sudo mkdir -p /opt/unityhub/UnityLicensingClient
+            sudo cp -a "$CLIENT_DIR"/. /opt/unityhub/UnityLicensingClient/
+            sudo chmod +x /opt/unityhub/UnityLicensingClient/Unity.Licensing.Client || true
+          fi
+
+          GLOBAL_NODE_MODULES="$(npm root -g)"
+          LICENSE_MODULE="$GLOBAL_NODE_MODULES/@rage-against-the-pixel/unity-cli/dist/license-client.js"
+
+          test -f "$LICENSE_MODULE"
+
+          export LICENSE_MODULE
+
+          node <<'NODE'
+          const { LicensingClient, LicenseType } =
+            require(process.env.LICENSE_MODULE);
+
+          async function main() {
+            const client = new LicensingClient('6.x');
+
+            await client.Activate(
+              {
+                licenseType: LicenseType.personal,
+                username: process.env.UNITY_USERNAME,
+                password: process.env.UNITY_PASSWORD
+              },
+              true
+            );
+
+            console.log("UNITY PERSONAL ACTIVATION: SUCCESS");
+          }
+
+          main().catch((e) => {
+            console.error("UNITY PERSONAL ACTIVATION FAILED");
+            console.error(e && e.stack ? e.stack : e);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Install Unity 2017.4.40f1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$WORK/unity-2017"
+
+          URL="https://download.unity3d.com/download_unity/${MIGRATION_CHANGESET}/LinuxEditorInstaller/Unity-${MIGRATION_UNITY}.tar.xz"
+
+          curl -fL \
+            --retry 5 \
+            --retry-delay 5 \
+            "$URL" \
+            -o "$WORK/Unity-${MIGRATION_UNITY}.tar.xz"
+
+          tar -xJf \
+            "$WORK/Unity-${MIGRATION_UNITY}.tar.xz" \
+            -C "$WORK/unity-2017"
+
+          UNITY2017="$(
+            find "$WORK/unity-2017" \
+              -type f \
+              -path '*/Editor/Unity' \
+              -perm -111 \
+              -print \
+              | head -1
+          )"
+
+          test -n "$UNITY2017"
+
+          echo "UNITY2017=$UNITY2017" >> "$GITHUB_ENV"
+          "$UNITY2017" -version || true
+
+      - name: Unity 2017 compatibility migration
+        shell: bash
+        run: |
+          set +e
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+          export PROJECT
+
+          LOG="$OUTPUT/unity-2017-migration.log"
+
+          rm -rf \
+            "$PROJECT/Library" \
+            "$PROJECT/Temp" \
+            "$PROJECT/obj" \
+            2>/dev/null || true
+
+          timeout 75m \
+            xvfb-run -a \
+            "$UNITY2017" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PROJECT" \
+            -logFile "$LOG"
+
+          RC=$?
+
+          echo "UNITY2017_EXIT_CODE=$RC" | tee "$OUTPUT/unity-2017-exit-code.txt"
+
+          tail -350 "$LOG" || true
+
+          set -e
+
+      - name: Prepare Unity 2019 project and iOS repair scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+          export PROJECT
+
+          mkdir -p "$PROJECT/Packages"
+          mkdir -p "$PROJECT/Assets/MSC2021iOS/Editor"
+
+          cat > "$PROJECT/Packages/manifest.json" <<'JSON'
+          {
+            "dependencies": {
+              "com.unity.ugui": "1.0.0",
+              "com.unity.modules.ai": "1.0.0",
+              "com.unity.modules.animation": "1.0.0",
+              "com.unity.modules.assetbundle": "1.0.0",
+              "com.unity.modules.audio": "1.0.0",
+              "com.unity.modules.cloth": "1.0.0",
+              "com.unity.modules.director": "1.0.0",
+              "com.unity.modules.imageconversion": "1.0.0",
+              "com.unity.modules.imgui": "1.0.0",
+              "com.unity.modules.jsonserialize": "1.0.0",
+              "com.unity.modules.particlesystem": "1.0.0",
+              "com.unity.modules.physics": "1.0.0",
+              "com.unity.modules.physics2d": "1.0.0",
+              "com.unity.modules.screencapture": "1.0.0",
+              "com.unity.modules.terrain": "1.0.0",
+              "com.unity.modules.terrainphysics": "1.0.0",
+              "com.unity.modules.tilemap": "1.0.0",
+              "com.unity.modules.ui": "1.0.0",
+              "com.unity.modules.uielements": "1.0.0",
+              "com.unity.modules.umbra": "1.0.0",
+              "com.unity.modules.unityanalytics": "1.0.0",
+              "com.unity.modules.unitywebrequest": "1.0.0",
+              "com.unity.modules.unitywebrequestassetbundle": "1.0.0",
+              "com.unity.modules.unitywebrequestaudio": "1.0.0",
+              "com.unity.modules.unitywebrequesttexture": "1.0.0",
+              "com.unity.modules.unitywebrequestwww": "1.0.0",
+              "com.unity.modules.vehicles": "1.0.0",
+              "com.unity.modules.video": "1.0.0",
+              "com.unity.modules.vr": "1.0.0",
+              "com.unity.modules.wind": "1.0.0",
+              "com.unity.modules.xr": "1.0.0"
+            }
+          }
+          JSON
+
+          rm -f "$PROJECT/Packages/packages-lock.json" || true
+
+          cat > "$PROJECT/ProjectSettings/ProjectVersion.txt" <<'EOF'
+          m_EditorVersion: 2019.4.40f1
+          m_EditorVersionWithRevision: 2019.4.40f1 (ffc62b691db5)
+          EOF
+
+          cat > "$PROJECT/Assets/MSC2021iOS/MSC2021RuntimeLogger.cs" <<'CS'
+          using System;
+          using System.IO;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          public sealed class MSC2021RuntimeLogger : MonoBehaviour
+          {
+              private string logPath;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+              private static void Install()
+              {
+                  if (FindObjectOfType<MSC2021RuntimeLogger>() != null)
+                      return;
+
+                  var go = new GameObject("MSC2021-iOS-Stability");
+                  DontDestroyOnLoad(go);
+                  go.AddComponent<MSC2021RuntimeLogger>();
+              }
+
+              private void Awake()
+              {
+                  logPath = Path.Combine(
+                      Application.persistentDataPath,
+                      "msc2021-ios-runtime.log"
+                  );
+
+                  Screen.sleepTimeout = SleepTimeout.NeverSleep;
+                  Input.multiTouchEnabled = true;
+                  QualitySettings.vSyncCount = 0;
+                  Application.targetFrameRate = 60;
+
+                  Application.logMessageReceived += OnLog;
+                  Application.lowMemory += OnLowMemory;
+                  SceneManager.sceneLoaded += OnSceneLoaded;
+
+                  Write(
+                      "START Unity=" + Application.unityVersion +
+                      " OS=" + SystemInfo.operatingSystem +
+                      " GPU=" + SystemInfo.graphicsDeviceName +
+                      " Graphics=" + SystemInfo.graphicsDeviceVersion
+                  );
+              }
+
+              private void OnDestroy()
+              {
+                  Application.logMessageReceived -= OnLog;
+                  Application.lowMemory -= OnLowMemory;
+                  SceneManager.sceneLoaded -= OnSceneLoaded;
+              }
+
+              private void OnLowMemory()
+              {
+                  Write("LOW_MEMORY");
+                  Resources.UnloadUnusedAssets();
+              }
+
+              private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+              {
+                  Write("SCENE_LOADED " + scene.name);
+              }
+
+              private void OnLog(string condition, string stackTrace, LogType type)
+              {
+                  if (type == LogType.Log)
+                      return;
+
+                  Write(
+                      "[" + type + "] " +
+                      condition + "\n" +
+                      stackTrace
+                  );
+              }
+
+              private void Write(string message)
+              {
+                  try
+                  {
+                      File.AppendAllText(
+                          logPath,
+                          "[" + DateTime.UtcNow.ToString("O") + "] " +
+                          message + "\n"
+                      );
+                  }
+                  catch
+                  {
+                  }
+              }
+          }
+          CS
+
+          cat > "$PROJECT/Assets/MSC2021iOS/Editor/MSC2021IOSBuild.cs" <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using System.Collections.Generic;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEngine;
+          using UnityEngine.Rendering;
+
+          public static class MSC2021IOSBuild
+          {
+              private const string DummyPrefix = "RecoveredDummy/";
+
+              public static void WarmupAndRepair()
+              {
+                  RepairMaterials();
+                  AssetDatabase.SaveAssets();
+                  AssetDatabase.Refresh();
+              }
+
+              public static void PerformBuild()
+              {
+                  string output =
+                      Environment.GetEnvironmentVariable("MSC_IOS_XCODE_PATH");
+
+                  if (String.IsNullOrEmpty(output))
+                      throw new Exception("MSC_IOS_XCODE_PATH is missing.");
+
+                  Directory.CreateDirectory(output);
+
+                  RepairMaterials();
+                  ApplyOriginalIcon();
+
+                  EditorUserBuildSettings.SwitchActiveBuildTarget(
+                      BuildTargetGroup.iOS,
+                      BuildTarget.iOS
+                  );
+
+                  PlayerSettings.companyName = "MSC 2021 Mobile iOS Port";
+                  PlayerSettings.productName = "My Summer Car 2021 Mobile";
+                  PlayerSettings.bundleVersion = "1.0";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.negel.msc2021mobile"
+                  );
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.SetApiCompatibilityLevel(
+                      BuildTargetGroup.iOS,
+                      ApiCompatibilityLevel.NET_4_6
+                  );
+
+                  PlayerSettings.iOS.targetOSVersionString = "12.0";
+                  PlayerSettings.iOS.sdkVersion = iOSSdkVersion.DeviceSDK;
+                  PlayerSettings.iOS.targetDevice = iOSTargetDevice.iPhoneAndiPad;
+                  PlayerSettings.iOS.appleEnableAutomaticSigning = false;
+
+                  PlayerSettings.stripEngineCode = false;
+
+                  PlayerSettings.SetManagedStrippingLevel(
+                      BuildTargetGroup.iOS,
+                      ManagedStrippingLevel.Disabled
+                  );
+
+                  PlayerSettings.colorSpace = ColorSpace.Gamma;
+                  PlayerSettings.defaultInterfaceOrientation =
+                      UIOrientation.LandscapeLeft;
+
+                  PlayerSettings.allowedAutorotateToPortrait = false;
+                  PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
+                  PlayerSettings.allowedAutorotateToLandscapeLeft = true;
+                  PlayerSettings.allowedAutorotateToLandscapeRight = true;
+
+                  PlayerSettings.SetUseDefaultGraphicsAPIs(
+                      BuildTarget.iOS,
+                      false
+                  );
+
+                  PlayerSettings.SetGraphicsAPIs(
+                      BuildTarget.iOS,
+                      new[]
+                      {
+                          GraphicsDeviceType.Metal
+                      }
+                  );
+
+                  string[] scenes = GetScenes();
+
+                  if (scenes.Length == 0)
+                      throw new Exception("No recovered Unity scenes were found.");
+
+                  Debug.Log("===== MSC2021 iOS SCENES =====");
+
+                  foreach (string scene in scenes)
+                      Debug.Log(scene);
+
+                  var options = new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      locationPathName = output,
+                      target = BuildTarget.iOS,
+                      targetGroup = BuildTargetGroup.iOS,
+                      options = BuildOptions.None
+                  };
+
+                  BuildReport report = BuildPipeline.BuildPlayer(options);
+                  BuildSummary summary = report.summary;
+
+                  Debug.Log(
+                      "MSC2021 iOS build result: " +
+                      summary.result +
+                      " errors=" + summary.totalErrors +
+                      " warnings=" + summary.totalWarnings
+                  );
+
+                  if (summary.result != BuildResult.Succeeded)
+                  {
+                      throw new Exception(
+                          "iOS Xcode export failed: " +
+                          summary.result +
+                          ", errors=" +
+                          summary.totalErrors
+                      );
+                  }
+              }
+
+              private static string[] GetScenes()
+              {
+                  string[] enabled = EditorBuildSettings.scenes
+                      .Where(s => s.enabled && File.Exists(s.path))
+                      .Select(s => s.path)
+                      .Distinct()
+                      .ToArray();
+
+                  if (enabled.Length > 0)
+                      return enabled;
+
+                  string[] all = AssetDatabase
+                      .FindAssets("t:Scene")
+                      .Select(AssetDatabase.GUIDToAssetPath)
+                      .Where(
+                          p => p.EndsWith(
+                              ".unity",
+                              StringComparison.OrdinalIgnoreCase
+                          )
+                      )
+                      .Distinct()
+                      .ToArray();
+
+                  string[] preferred =
+                  {
+                      "menu",
+                      "mainmenu",
+                      "main menu",
+                      "loading",
+                      "game",
+                      "house",
+                      "world"
+                  };
+
+                  var ordered = new List<string>();
+
+                  foreach (string wanted in preferred)
+                  {
+                      foreach (string scene in all)
+                      {
+                          string name = Path
+                              .GetFileNameWithoutExtension(scene)
+                              .ToLowerInvariant();
+
+                          if (
+                              name.Contains(wanted.Replace(" ", "")) ||
+                              name.Contains(wanted)
+                          )
+                          {
+                              if (!ordered.Contains(scene))
+                                  ordered.Add(scene);
+                          }
+                      }
+                  }
+
+                  foreach (string scene in all.OrderBy(x => x))
+                  {
+                      if (!ordered.Contains(scene))
+                          ordered.Add(scene);
+                  }
+
+                  return ordered.ToArray();
+              }
+
+              private static void RepairMaterials()
+              {
+                  var report = new List<string>();
+                  int repaired = 0;
+                  int untouched = 0;
+
+                  string[] guids = AssetDatabase.FindAssets("t:Material");
+
+                  foreach (string guid in guids)
+                  {
+                      string path = AssetDatabase.GUIDToAssetPath(guid);
+                      Material mat = AssetDatabase.LoadAssetAtPath<Material>(path);
+
+                      if (mat == null)
+                          continue;
+
+                      Shader current = mat.shader;
+                      string name =
+                          current == null
+                              ? ""
+                              : current.name;
+
+                      bool needsRepair =
+                          current == null ||
+                          !current.isSupported ||
+                          name.StartsWith(
+                              DummyPrefix,
+                              StringComparison.OrdinalIgnoreCase
+                          );
+
+                      if (!needsRepair)
+                      {
+                          untouched++;
+                          continue;
+                      }
+
+                      string originalName = name;
+
+                      if (
+                          originalName.StartsWith(
+                              DummyPrefix,
+                              StringComparison.OrdinalIgnoreCase
+                          )
+                      )
+                      {
+                          originalName =
+                              originalName.Substring(
+                                  DummyPrefix.Length
+                              );
+                      }
+
+                      Shader replacement =
+                          FindReplacementShader(originalName);
+
+                      if (replacement == null)
+                      {
+                          report.Add(
+                              "FAILED :: " +
+                              path +
+                              " :: " +
+                              originalName
+                          );
+
+                          continue;
+                      }
+
+                      mat.shader = replacement;
+                      EditorUtility.SetDirty(mat);
+                      repaired++;
+
+                      report.Add(
+                          "REPAIRED :: " +
+                          path +
+                          " :: " +
+                          originalName +
+                          " -> " +
+                          replacement.name
+                      );
+                  }
+
+                  AssetDatabase.SaveAssets();
+
+                  report.Insert(
+                      0,
+                      "UNTOUCHED=" + untouched
+                  );
+
+                  report.Insert(
+                      0,
+                      "REPAIRED=" + repaired
+                  );
+
+                  string dir =
+                      Environment.GetEnvironmentVariable(
+                          "MSC_DIAG_DIR"
+                      );
+
+                  if (!String.IsNullOrEmpty(dir))
+                  {
+                      Directory.CreateDirectory(dir);
+
+                      File.WriteAllLines(
+                          Path.Combine(
+                              dir,
+                              "material-repair.txt"
+                          ),
+                          report.ToArray()
+                      );
+                  }
+
+                  Debug.Log(
+                      "MSC material repair: repaired=" +
+                      repaired +
+                      " untouched=" +
+                      untouched
+                  );
+              }
+
+              private static Shader FindReplacementShader(
+                  string original
+              )
+              {
+                  string s =
+                      (original ?? "")
+                      .Trim();
+
+                  string lower =
+                      s.ToLowerInvariant();
+
+                  string[] candidates;
+
+                  if (lower.Contains("ui/"))
+                  {
+                      candidates = new[]
+                      {
+                          "UI/Default",
+                          "Unlit/Transparent",
+                          "Standard"
+                      };
+                  }
+                  else if (lower.Contains("sprite"))
+                  {
+                      candidates = new[]
+                      {
+                          "Sprites/Default",
+                          "Unlit/Transparent",
+                          "Standard"
+                      };
+                  }
+                  else if (lower.Contains("particle"))
+                  {
+                      candidates = new[]
+                      {
+                          "Particles/Standard Unlit",
+                          "Legacy Shaders/Particles/Additive",
+                          "Legacy Shaders/Particles/Alpha Blended",
+                          "Standard"
+                      };
+                  }
+                  else if (
+                      lower.Contains("transparent") ||
+                      lower.Contains("fade")
+                  )
+                  {
+                      candidates = new[]
+                      {
+                          "Legacy Shaders/Transparent/Diffuse",
+                          "Unlit/Transparent",
+                          "Standard"
+                      };
+                  }
+                  else if (
+                      lower.Contains("cutout") ||
+                      lower.Contains("alphatest")
+                  )
+                  {
+                      candidates = new[]
+                      {
+                          "Legacy Shaders/Transparent/Cutout/Diffuse",
+                          "Unlit/Transparent Cutout",
+                          "Standard"
+                      };
+                  }
+                  else if (lower.Contains("mobile/"))
+                  {
+                      candidates = new[]
+                      {
+                          s,
+                          "Mobile/Diffuse",
+                          "Standard"
+                      };
+                  }
+                  else if (lower.Contains("legacy shaders/"))
+                  {
+                      candidates = new[]
+                      {
+                          s,
+                          "Legacy Shaders/Diffuse",
+                          "Standard"
+                      };
+                  }
+                  else if (lower.Contains("specular"))
+                  {
+                      candidates = new[]
+                      {
+                          "Standard (Specular setup)",
+                          "Standard"
+                      };
+                  }
+                  else if (lower.Contains("unlit"))
+                  {
+                      candidates = new[]
+                      {
+                          "Unlit/Texture",
+                          "Standard"
+                      };
+                  }
+                  else
+                  {
+                      candidates = new[]
+                      {
+                          s,
+                          "Standard",
+                          "Legacy Shaders/Diffuse",
+                          "Mobile/Diffuse"
+                      };
+                  }
+
+                  foreach (string candidate in candidates)
+                  {
+                      if (String.IsNullOrEmpty(candidate))
+                          continue;
+
+                      Shader shader = Shader.Find(candidate);
+
+                      if (
+                          shader != null &&
+                          shader.isSupported &&
+                          !shader.name.StartsWith(
+                              DummyPrefix,
+                              StringComparison.OrdinalIgnoreCase
+                          )
+                      )
+                      {
+                          return shader;
+                      }
+                  }
+
+                  return null;
+              }
+
+              private static void ApplyOriginalIcon()
+              {
+                  const string iconPath =
+                      "Assets/MSC2021iOS/app_icon.png";
+
+                  AssetDatabase.ImportAsset(
+                      iconPath,
+                      ImportAssetOptions.ForceSynchronousImport |
+                      ImportAssetOptions.ForceUpdate
+                  );
+
+                  var importer =
+                      AssetImporter.GetAtPath(
+                          iconPath
+                      ) as TextureImporter;
+
+                  if (importer != null)
+                  {
+                      importer.textureType =
+                          TextureImporterType.Default;
+
+                      importer.alphaIsTransparency = true;
+                      importer.mipmapEnabled = false;
+                      importer.textureCompression =
+                          TextureImporterCompression.Uncompressed;
+
+                      importer.SaveAndReimport();
+                  }
+
+                  Texture2D icon =
+                      AssetDatabase.LoadAssetAtPath<Texture2D>(
+                          iconPath
+                      );
+
+                  if (icon == null)
+                      return;
+
+                  int[] sizes =
+                      PlayerSettings.GetIconSizesForTargetGroup(
+                          BuildTargetGroup.iOS
+                      );
+
+                  Texture2D[] icons =
+                      new Texture2D[sizes.Length];
+
+                  for (int i = 0; i < icons.Length; i++)
+                      icons[i] = icon;
+
+                  PlayerSettings.SetIconsForTargetGroup(
+                      BuildTargetGroup.iOS,
+                      icons
+                  );
+              }
+          }
+          CS
+
+      - name: Install official Unity CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export UNITY_CLI_HOME="$WORK/tools/unity-official-cli"
+          export UNITY_CLI_CHANNEL="beta"
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+
+          mkdir -p "$UNITY_CLI_HOME"
+
+          curl -fsSL \
+            --retry 5 \
+            --retry-delay 3 \
+            https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh \
+            -o "$WORK/unity-cli-install.sh"
+
+          bash "$WORK/unity-cli-install.sh"
+
+          OFFICIAL="$UNITY_CLI_HOME/bin/unity"
+
+          test -x "$OFFICIAL"
+
+          echo "OFFICIAL_UNITY_CLI=$OFFICIAL" >> "$GITHUB_ENV"
+          "$OFFICIAL" --version
+
+      - name: Install Unity 2019.4.40f1 and iOS support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INSTALL_ROOT="$HOME/UnityEditors"
+
+          mkdir -p "$INSTALL_ROOT"
+
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+          export UNITY_INSTALL_RETRIES=3
+
+          "$OFFICIAL_UNITY_CLI" \
+            --non-interactive \
+            --no-banner \
+            --no-color \
+            editors install-path \
+            --set "$INSTALL_ROOT"
+
+          set +e
+
+          timeout 85m \
+            "$OFFICIAL_UNITY_CLI" \
+            --non-interactive \
+            --no-banner \
+            --no-color \
+            install "$BUILD_UNITY" \
+            --changeset "$BUILD_CHANGESET" \
+            --module ios \
+            --no-child-modules \
+            --yes \
+            --accept-eula \
+            2>&1 \
+            | tee "$OUTPUT/unity-2019-install.log"
+
+          RC=${PIPESTATUS[0]}
+
+          set -e
+
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Unity 2019 install failed with exit $RC."
+            exit "$RC"
+          fi
+
+          UNITY2019="$(
+            find "$INSTALL_ROOT" \
+              -type f \
+              -path '*/Editor/Unity' \
+              -perm -111 \
+              -print \
+              | grep '2019.4.40f1' \
+              | head -1
+          )"
+
+          if [ -z "${UNITY2019:-}" ]; then
+            UNITY2019="$(
+              find "$INSTALL_ROOT" \
+                -type f \
+                -path '*/Editor/Unity' \
+                -perm -111 \
+                -print \
+                | head -1
+            )"
+          fi
+
+          if [ -z "$UNITY2019" ]; then
+            echo "::error::Unity 2019 Editor executable was not found."
+            exit 1
+          fi
+
+          echo "UNITY2019=$UNITY2019" >> "$GITHUB_ENV"
+          "$UNITY2019" -version || true
+
+      - name: Unity 2019 warm-up and material repair
+        id: warmup
+        shell: bash
+        env:
+          MSC_DIAG_DIR: ${{ github.workspace }}/msc-output
+        run: |
+          set +e
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+          export PROJECT
+
+          LOG="$OUTPUT/unity-2019-warmup.log"
+
+          rm -rf \
+            "$PROJECT/Library" \
+            "$PROJECT/Temp" \
+            "$PROJECT/obj" \
+            2>/dev/null || true
+
+          timeout 90m \
+            xvfb-run -a \
+            "$UNITY2019" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -accept-apiupdate \
+            -projectPath "$PROJECT" \
+            -executeMethod MSC2021IOSBuild.WarmupAndRepair \
+            -logFile "$LOG"
+
+          RC=$?
+
+          echo "UNITY2019_WARMUP_EXIT_CODE=$RC" \
+            | tee "$OUTPUT/unity-2019-warmup-exit-code.txt"
+
+          tail -500 "$LOG" || true
+
+          grep -nEi \
+            -A 20 \
+            -B 8 \
+            'error CS[0-9]+|Compilation failed|Scripts have compiler errors|Exception|Fatal error|failed' \
+            "$LOG" \
+            | tail -700 \
+            > "$OUTPUT/unity-2019-warmup-important-errors.txt" \
+            || true
+
+          set -e
+
+      - name: Final compile audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+
+          echo "===== OLD UNITYSCRIPT USING ====="
+
+          if grep -RIn \
+            --include='*.cs' \
+            -E '^[[:space:]]*using[[:space:]]+UnityScript' \
+            "$PROJECT/Assets"
+          then
+            echo "::error::UnityScript using directive remains."
+            exit 1
+          fi
+
+          echo "===== OLD CAMERA HDR PROPERTY ====="
+
+          grep -RIn \
+            --include='*.cs' \
+            '\.hdr\b' \
+            "$PROJECT/Assets" \
+            | tee "$OUTPUT/remaining-camera-hdr.txt" \
+            || true
+
+          echo "===== ANDROIDJAVA REFERENCES ====="
+
+          grep -RIn \
+            --include='*.cs' \
+            -E 'AndroidJava(Class|Object)|AndroidJNI' \
+            "$PROJECT/Assets" \
+            | tee "$OUTPUT/androidjava-references.txt" \
+            || true
+
+          echo "Compile audit completed."
+
+      - name: Build MSC2021 iOS Xcode project
+        id: unity_build
+        shell: bash
+        env:
+          MSC_IOS_XCODE_PATH: ${{ github.workspace }}/msc-build/iOS/MSC2021Mobile-iOS
+          MSC_DIAG_DIR: ${{ github.workspace }}/msc-output
+        run: |
+          set +e
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+          LOG="$OUTPUT/unity-2019-ios-build.log"
+
+          rm -rf \
+            "$PROJECT/Library/ScriptAssemblies" \
+            "$PROJECT/Temp" \
+            "$PROJECT/obj" \
+            2>/dev/null || true
+
+          echo "===== MY SUMMER CAR 2021 MOBILE iOS ====="
+          echo "Source Unity: $SOURCE_UNITY"
+          echo "Migration Unity: $MIGRATION_UNITY"
+          echo "Build Unity: $BUILD_UNITY"
+          echo "Project: $PROJECT"
+          echo "Output: $MSC_IOS_XCODE_PATH"
+
+          timeout 120m \
+            xvfb-run -a \
+            "$UNITY2019" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -accept-apiupdate \
+            -projectPath "$PROJECT" \
+            -buildTarget iOS \
+            -executeMethod MSC2021IOSBuild.PerformBuild \
+            -logFile "$LOG"
+
+          RC=$?
+
+          echo "UNITY2019_EXIT_CODE=$RC" \
+            | tee "$OUTPUT/unity-2019-exit-code.txt"
+
+          echo "===== UNITY LOG TAIL ====="
+          tail -600 "$LOG" || true
+
+          echo "===== IMPORTANT UNITY ERRORS ====="
+
+          grep -nEi \
+            -A 25 \
+            -B 8 \
+            'error CS[0-9]+|Compilation failed|Scripts have compiler errors|compiler error|Exception|Error building Player|BuildFailedException|DllNotFoundException|TypeLoadException|MissingReferenceException|Fatal error|failed' \
+            "$LOG" \
+            | tail -800 \
+            | tee "$OUTPUT/unity-build-important-errors.txt" \
+            || true
+
+          exit "$RC"
+
+      - name: Detect Xcode project
+        id: detect_xcode
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          READY=false
+
+          if [ -d "$XCODE_OUT" ] && \
+             find "$XCODE_OUT" \
+               -maxdepth 4 \
+               \( \
+                 -name '*.xcodeproj' \
+                 -o -name '*.xcworkspace' \
+               \) \
+               | grep -q .
+          then
+            READY=true
+          fi
+
+          echo "ready=$READY" >> "$GITHUB_OUTPUT"
+
+          if [ "$READY" = true ]; then
+            find "$XCODE_OUT" \
+              -maxdepth 4 \
+              \( \
+                -name '*.xcodeproj' \
+                -o -name '*.xcworkspace' \
+              \) \
+              -print
+          else
+            echo "No Xcode project was generated."
+          fi
+
+      - name: Pack Xcode project
+        if: steps.detect_xcode.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar \
+            -C "$(dirname "$XCODE_OUT")" \
+            -czf \
+              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Xcode.tar.gz" \
+            "$(basename "$XCODE_OUT")"
+
+          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Xcode.tar.gz"
+
+      - name: Collect Unity diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Diagnostics"
+
+          rm -rf "$DIAG"
+          mkdir -p "$DIAG"
+
+          cp "$OUTPUT"/*.txt "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT"/*.log "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/MSC2021-original-icon.png" "$DIAG/" 2>/dev/null || true
+
+          if [ -n "${PROJECT:-}" ] && [ -f "$PROJECT/ProjectSettings/ProjectVersion.txt" ]; then
+            cp "$PROJECT/ProjectSettings/ProjectVersion.txt" "$DIAG/" || true
+          fi
+
+          {
+            echo "SOURCE_UNITY=$SOURCE_UNITY"
+            echo "MIGRATION_UNITY=$MIGRATION_UNITY"
+            echo "BUILD_UNITY=$BUILD_UNITY"
+            echo "XCODE_READY=${{ steps.detect_xcode.outputs.ready }}"
+            echo "RECOVER_OUTCOME=${{ steps.recover.outcome }}"
+            echo "WARMUP_OUTCOME=${{ steps.warmup.outcome }}"
+            echo "UNITY_BUILD_OUTCOME=${{ steps.unity_build.outcome }}"
+          } > "$DIAG/summary.txt"
+
+          grep -RniE \
+            'error CS[0-9]+|Compilation failed|compiler error|Exception|failed|failure|unsupported|DllNotFoundException|TypeLoadException|MissingReferenceException|BuildFailedException' \
+            "$DIAG" \
+            > "$DIAG/important-errors.txt" \
+            2>/dev/null || true
+
+          zip -qr \
+            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Diagnostics.zip" \
+            "$DIAG"
+
+      - name: Upload Unity diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSC2021-Mobile-iOS-v1-Diagnostics
+          path: MSC2021-Mobile-iOS-v1-Diagnostics.zip
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Upload Xcode project
+        if: steps.detect_xcode.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSC2021-Mobile-iOS-v1-Xcode
+          path: MSC2021-Mobile-iOS-v1-Xcode.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Fail clearly if Unity did not export Xcode
+        if: always() && steps.detect_xcode.outputs.ready != 'true'
+        shell: bash
+        run: |
+          echo "::error::Unity did not generate the MSC2021 iOS Xcode project."
+          echo "Download MSC2021-Mobile-iOS-v1-Diagnostics and send it here."
+          exit 1
+
+  xcode_build:
+    name: 2. Build unsigned IPA on macOS
+    needs: recover_and_export
+    if: needs.recover_and_export.outputs.xcode_ready == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Download Xcode project
+        uses: actions/download-artifact@v4
+        with:
+          name: MSC2021-Mobile-iOS-v1-Xcode
+          path: xcode-artifact
+
+      - name: Extract Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf xcode
+          mkdir -p xcode
+
+          ARCHIVE="$(
+            find xcode-artifact \
+              -type f \
+              -name '*.tar.gz' \
+              -print \
+              | head -1
+          )"
+
+          test -s "$ARCHIVE"
+
+          tar -xzf "$ARCHIVE" -C xcode
+
+          find xcode \
+            -maxdepth 5 \
+            \( \
+              -name '*.xcodeproj' \
+              -o -name '*.xcworkspace' \
+            \) \
+            -print
+
+      - name: Patch project for modern Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild -version
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("xcode")
+          changed = []
+
+          for p in root.rglob("*"):
+              if not p.is_file():
+                  continue
+
+              if not (
+                  p.name == "project.pbxproj" or
+                  p.suffix == ".xcconfig"
+              ):
+                  continue
+
+              try:
+                  s = p.read_text(
+                      encoding="utf-8",
+                      errors="ignore"
+                  )
+              except Exception:
+                  continue
+
+              old = s
+
+              s = s.replace("-mno-thumb", "")
+
+              s = re.sub(
+                  r'IPHONEOS_DEPLOYMENT_TARGET = [^;]+;',
+                  'IPHONEOS_DEPLOYMENT_TARGET = 12.0;',
+                  s
+              )
+
+              s = re.sub(
+                  r'ENABLE_BITCODE = [^;]+;',
+                  'ENABLE_BITCODE = NO;',
+                  s
+              )
+
+              s = re.sub(
+                  r'CODE_SIGN_STYLE = [^;]+;',
+                  'CODE_SIGN_STYLE = Manual;',
+                  s
+              )
+
+              if s != old:
+                  p.write_text(s, encoding="utf-8")
+                  changed.append(str(p))
+
+          print("Patched files:", len(changed))
+
+          for p in changed:
+              print(" ", p)
+          PY
+
+          if grep -RIn -- '-mno-thumb' xcode; then
+            echo "::error::Legacy -mno-thumb flag still exists."
+            exit 1
+          fi
+
+          echo "Modern Xcode flag audit: CLEAN"
+
+      - name: Resolve Xcode container
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="$(
+            find xcode \
+              -type d \
+              -name '*.xcworkspace' \
+              -print \
+              | head -1
+          )"
+
+          PROJECT="$(
+            find xcode \
+              -type d \
+              -name '*.xcodeproj' \
+              -print \
+              | head -1
+          )"
+
+          if [ -n "$WORKSPACE" ]; then
+            echo "XCODE_KIND=workspace" >> "$GITHUB_ENV"
+            echo "XCODE_CONTAINER=$WORKSPACE" >> "$GITHUB_ENV"
+            xcodebuild -list -workspace "$WORKSPACE"
+          elif [ -n "$PROJECT" ]; then
+            echo "XCODE_KIND=project" >> "$GITHUB_ENV"
+            echo "XCODE_CONTAINER=$PROJECT" >> "$GITHUB_ENV"
+            xcodebuild -list -project "$PROJECT"
+          else
+            echo "::error::No Xcode workspace/project found."
+            exit 1
+          fi
+
+      - name: Build unsigned app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          rm -rf DerivedData xcode-build.log
+
+          if [ "$XCODE_KIND" = "workspace" ]; then
+            CONTAINER_ARGS=(
+              -workspace "$XCODE_CONTAINER"
+            )
+          else
+            CONTAINER_ARGS=(
+              -project "$XCODE_CONTAINER"
+            )
+          fi
+
+          xcodebuild \
+            "${CONTAINER_ARGS[@]}" \
+            -scheme "Unity-iPhone" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_BITCODE=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
+            build \
+            2>&1 \
+            | tee xcode-build.log
+
+      - name: Validate app
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(
+            find DerivedData/Build/Products \
+              -type d \
+              -path '*Release-iphoneos/*.app' \
+              -print \
+              | head -1
+          )"
+
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::.app was not found."
+            exit 1
+          fi
+
+          PLIST="$APP/Info.plist"
+          test -s "$PLIST"
+
+          EXEC="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleExecutable' \
+              "$PLIST"
+          )"
+
+          test -s "$APP/$EXEC"
+
+          APP_KB="$(du -sk "$APP" | awk '{print $1}')"
+
+          echo "APP_SIZE_KB=$APP_KB"
+
+          if [ "$APP_KB" -lt 20000 ]; then
+            echo "::error::App is suspiciously small."
+            exit 1
+          fi
+
+          echo "path=$APP" >> "$GITHUB_OUTPUT"
+
+          echo "===== APP VERIFIED ====="
+          du -sh "$APP"
+          file "$APP/$EXEC"
+          lipo -info "$APP/$EXEC" || true
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="${{ steps.app.outputs.path }}"
+
+          rm -rf Payload
+          mkdir -p Payload
+
+          cp -a "$APP" Payload/
+          xattr -cr Payload || true
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            Payload \
+            "MSC2021-Mobile-iOS-v1-unsigned.ipa"
+
+          ls -lh "MSC2021-Mobile-iOS-v1-unsigned.ipa"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSC2021-Mobile-iOS-v1-unsigned-IPA
+          path: MSC2021-Mobile-iOS-v1-unsigned.ipa
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Collect Xcode diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+
+          DIAG="MSC2021-Mobile-iOS-v1-Xcode-Diagnostics"
+
+          rm -rf "$DIAG"
+          mkdir -p "$DIAG"
+
+          cp xcode-build.log "$DIAG/" 2>/dev/null || true
+
+          PBX="$(
+            find xcode \
+              -type f \
+              -name 'project.pbxproj' \
+              -print \
+              | head -1
+          )"
+
+          if [ -n "$PBX" ]; then
+            cp "$PBX" "$DIAG/" 2>/dev/null || true
+          fi
+
+          {
+            xcodebuild -version
+            echo
+            echo "XCODE_KIND=$XCODE_KIND"
+            echo "XCODE_CONTAINER=$XCODE_CONTAINER"
+          } > "$DIAG/xcode-info.txt"
+
+          grep -nEi \
+            -A 20 \
+            -B 8 \
+            'error:|fatal error|undefined symbol|ld:|clang:|failed|failure' \
+            xcode-build.log \
+            | tail -800 \
+            > "$DIAG/important-errors.txt" \
+            2>/dev/null || true
+
+      - name: Upload Xcode diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSC2021-Mobile-iOS-v1-Xcode-Diagnostics
+          path: MSC2021-Mobile-iOS-v1-Xcode-Diagnostics
+          compression-level: 0
+          if-no-files-found: warn
