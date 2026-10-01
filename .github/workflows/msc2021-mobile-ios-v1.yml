@@ -1,4 +1,4 @@
-name: My Summer Car 2021 Mobile iOS - v1 NFS-Style Recovery
+name: My Summer Car 2021 Mobile iOS - v1.1 Boo Legacy Fix + Original Icon
 
 on:
   workflow_dispatch:
@@ -597,8 +597,6 @@ jobs:
               "System.Security.dll",
               "Mono.Security.dll",
               "Mono.Posix.dll",
-              "Boo.Lang.dll",
-              "UnityScript.Lang.dll",
           }
 
           moved_root = project.parent / "removed-runtime-dlls"
@@ -618,12 +616,75 @@ jobs:
                   print("moved", rel)
           PY
 
+          echo "===== RESTORE ORIGINAL UNITYSCRIPT/BOO COMPATIBILITY DLLS ====="
+
+          LEGACY_DIR="$PROJECT/Assets/Plugins/LegacyUnityScript"
+          mkdir -p "$LEGACY_DIR"
+
+          # AssetRipper's decompiled CharacterMotor.cs still uses
+          # Boo.Lang.CompilerServices.GenericGenerator/GenericGeneratorEnumerator.
+          # Unity 2019 no longer ships Boo/UnityScript, so restore the exact DLLs
+          # from THIS APK instead of trying to rewrite CharacterMotor by hand.
+          find "$PROJECT/Assets" \
+            -type f \
+            \( -name 'Boo.Lang.dll' -o -name 'UnityScript.Lang.dll' \) \
+            -delete || true
+
+          find "$PROJECT/Assets" \
+            -type f \
+            \( -name 'Boo.Lang.dll.meta' -o -name 'UnityScript.Lang.dll.meta' \) \
+            -delete || true
+
+          test -s "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll"
+          test -s "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll"
+
+          cp \
+            "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll" \
+            "$LEGACY_DIR/Boo.Lang.dll"
+
+          cp \
+            "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll" \
+            "$LEGACY_DIR/UnityScript.Lang.dll"
+
+          {
+            echo "Boo.Lang.dll:"
+            sha256sum "$LEGACY_DIR/Boo.Lang.dll"
+            echo
+            echo "UnityScript.Lang.dll:"
+            sha256sum "$LEGACY_DIR/UnityScript.Lang.dll"
+            echo
+            echo "CharacterMotor Boo references:"
+            grep -RIn \
+              --include='CharacterMotor.cs' \
+              -E 'Boo\.Lang|GenericGenerator|GenericGeneratorEnumerator' \
+              "$PROJECT/Assets/Plugins" \
+              || true
+          } | tee "$OUTPUT/legacy-boo-unityscript-v1.1.txt"
+
           mkdir -p \
             "$PROJECT/Assets/MSC2021iOS/Editor"
 
+          # ORIGINAL APK ICON.
+          # This file was extracted directly from MSC2021Mobile.apk above.
           cp \
             "$OUTPUT/MSC2021-original-icon.png" \
             "$PROJECT/Assets/MSC2021iOS/app_icon.png"
+
+          {
+            echo "Original APK icon source:"
+            sha256sum "$OUTPUT/MSC2021-original-icon.png"
+            echo "Unity project icon copy:"
+            sha256sum "$PROJECT/Assets/MSC2021iOS/app_icon.png"
+          } | tee "$OUTPUT/original-icon-sha256-v1.1.txt"
+
+          if [ "$(
+            sha256sum "$OUTPUT/MSC2021-original-icon.png" | awk '{print $1}'
+          )" != "$(
+            sha256sum "$PROJECT/Assets/MSC2021iOS/app_icon.png" | awk '{print $1}'
+          )" ]; then
+            echo "::error::Original APK icon copy does not match."
+            exit 1
+          fi
 
           cat > "$PROJECT/ProjectSettings/ProjectVersion.txt" <<'EOF'
           m_EditorVersion: 2017.4.40f1
@@ -1701,8 +1762,30 @@ jobs:
 
           PROJECT="${{ steps.recover.outputs.project }}"
 
+          echo "===== BOO / UNITYSCRIPT COMPATIBILITY ====="
+
+          test -s "$PROJECT/Assets/Plugins/LegacyUnityScript/Boo.Lang.dll" || {
+            echo "::error::Boo.Lang.dll is missing."
+            exit 1
+          }
+
+          test -s "$PROJECT/Assets/Plugins/LegacyUnityScript/UnityScript.Lang.dll" || {
+            echo "::error::UnityScript.Lang.dll is missing."
+            exit 1
+          }
+
+          if grep -RIn \
+            --include='CharacterMotor.cs' \
+            -E 'Boo\.Lang|GenericGenerator|GenericGeneratorEnumerator' \
+            "$PROJECT/Assets/Plugins" >/dev/null
+          then
+            echo "CharacterMotor uses Boo compiler helpers: compatibility DLLs are present."
+          fi
+
           echo "===== OLD UNITYSCRIPT USING ====="
 
+          # We remove obsolete `using UnityScript...` source directives, but the
+          # original UnityScript.Lang.dll remains available for generated legacy code.
           if grep -RIn \
             --include='*.cs' \
             -E '^[[:space:]]*using[[:space:]]+UnityScript' \
@@ -1834,10 +1917,10 @@ jobs:
           tar \
             -C "$(dirname "$XCODE_OUT")" \
             -czf \
-              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Xcode.tar.gz" \
+              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Xcode.tar.gz" \
             "$(basename "$XCODE_OUT")"
 
-          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Xcode.tar.gz"
+          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Xcode.tar.gz"
 
       - name: Collect Unity diagnostics
         if: always()
@@ -1845,7 +1928,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -1853,6 +1936,8 @@ jobs:
           cp "$OUTPUT"/*.txt "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT"/*.log "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT/MSC2021-original-icon.png" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/legacy-boo-unityscript-v1.1.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/original-icon-sha256-v1.1.txt" "$DIAG/" 2>/dev/null || true
 
           if [ -n "${PROJECT:-}" ] && [ -f "$PROJECT/ProjectSettings/ProjectVersion.txt" ]; then
             cp "$PROJECT/ProjectSettings/ProjectVersion.txt" "$DIAG/" || true
@@ -1875,15 +1960,15 @@ jobs:
             2>/dev/null || true
 
           zip -qr \
-            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1-Diagnostics.zip" \
+            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Diagnostics.zip" \
             "$DIAG"
 
       - name: Upload Unity diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1-Diagnostics
-          path: MSC2021-Mobile-iOS-v1-Diagnostics.zip
+          name: MSC2021-Mobile-iOS-v1.1-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.1-Diagnostics.zip
           compression-level: 0
           if-no-files-found: warn
 
@@ -1891,8 +1976,8 @@ jobs:
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1-Xcode
-          path: MSC2021-Mobile-iOS-v1-Xcode.tar.gz
+          name: MSC2021-Mobile-iOS-v1.1-Xcode
+          path: MSC2021-Mobile-iOS-v1.1-Xcode.tar.gz
           compression-level: 0
           if-no-files-found: error
 
@@ -1901,7 +1986,7 @@ jobs:
         shell: bash
         run: |
           echo "::error::Unity did not generate the MSC2021 iOS Xcode project."
-          echo "Download MSC2021-Mobile-iOS-v1-Diagnostics and send it here."
+          echo "Download MSC2021-Mobile-iOS-v1.1-Diagnostics and send it here."
           exit 1
 
   xcode_build:
@@ -1915,7 +2000,7 @@ jobs:
       - name: Download Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1-Xcode
+          name: MSC2021-Mobile-iOS-v1.1-Xcode
           path: xcode-artifact
 
       - name: Extract Xcode project
@@ -2153,15 +2238,15 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "MSC2021-Mobile-iOS-v1-unsigned.ipa"
+            "MSC2021-Mobile-iOS-v1.1-unsigned.ipa"
 
-          ls -lh "MSC2021-Mobile-iOS-v1-unsigned.ipa"
+          ls -lh "MSC2021-Mobile-iOS-v1.1-unsigned.ipa"
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1-unsigned-IPA
-          path: MSC2021-Mobile-iOS-v1-unsigned.ipa
+          name: MSC2021-Mobile-iOS-v1.1-unsigned-IPA
+          path: MSC2021-Mobile-iOS-v1.1-unsigned.ipa
           compression-level: 0
           if-no-files-found: error
 
@@ -2171,7 +2256,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="MSC2021-Mobile-iOS-v1-Xcode-Diagnostics"
+          DIAG="MSC2021-Mobile-iOS-v1.1-Xcode-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -2210,7 +2295,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1-Xcode-Diagnostics
-          path: MSC2021-Mobile-iOS-v1-Xcode-Diagnostics
+          name: MSC2021-Mobile-iOS-v1.1-Xcode-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.1-Xcode-Diagnostics
           compression-level: 0
           if-no-files-found: warn
