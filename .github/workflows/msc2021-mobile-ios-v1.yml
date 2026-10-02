@@ -1,4 +1,4 @@
-name: My Summer Car 2021 Mobile iOS - v1.2 Steamworks Fix + Fail Fast + Original Icon
+name: My Summer Car 2021 Mobile iOS - v1.3 Fast Preflight + Steamworks + DepthOfField Fix
 
 on:
   workflow_dispatch:
@@ -629,7 +629,7 @@ jobs:
             sha256sum "$OUTPUT/MSC2021-original-icon.png"
             echo "Unity project icon copy:"
             sha256sum "$PROJECT/Assets/MSC2021iOS/app_icon.png"
-          } | tee "$OUTPUT/original-icon-sha256-v1.2.txt"
+          } | tee "$OUTPUT/original-icon-sha256-v1.3.txt"
 
           if [ "$(
             sha256sum "$OUTPUT/MSC2021-original-icon.png" | awk '{print $1}'
@@ -641,8 +641,8 @@ jobs:
           fi
 
           cat > "$PROJECT/ProjectSettings/ProjectVersion.txt" <<'EOF'
-          m_EditorVersion: 2017.4.40f1
-          m_EditorVersionWithRevision: 2017.4.40f1 (6e14067f8a9a)
+          m_EditorVersion: 2019.4.40f1
+          m_EditorVersionWithRevision: 2019.4.40f1 (ffc62b691db5)
           EOF
 
           echo "===== PATCH COMMON OLD UNITY APIS ====="
@@ -670,9 +670,12 @@ jobs:
               s = re.sub(r'\bGUIText\b', 'UnityEngine.UI.Text', s)
               s = re.sub(r'\bGUITexture\b', 'UnityEngine.UI.RawImage', s)
 
+              # Unity 2019.4 has Graphics.DrawProceduralIndirect.
+              # AssetRipper/older patch chains can leave the non-existent
+              # DrawProceduralIndirectNow name, so normalize it back.
               s = s.replace(
-                  'Graphics.DrawProceduralIndirect(',
-                  'Graphics.DrawProceduralIndirectNow('
+                  'Graphics.DrawProceduralIndirectNow(',
+                  'Graphics.DrawProceduralIndirect('
               )
 
               s = s.replace(
@@ -724,6 +727,228 @@ jobs:
 
           print("Patched C# files:", len(changed))
           PY
+
+      - name: Repair legacy Boo and Steamworks decompiler output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+
+          echo "===== RESTORE BOO / UNITYSCRIPT FOR UNITY 2019 ====="
+
+          LEGACY_DIR="$PROJECT/Assets/Plugins/LegacyUnityScript"
+          mkdir -p "$LEGACY_DIR"
+
+          # The recovered CharacterMotor uses legacy Boo generator helpers.
+          # Unity 2019 no longer ships these assemblies, so restore the exact APK copies.
+          find "$PROJECT/Assets" \
+            -type f \
+            \( -name 'Boo.Lang.dll' -o -name 'UnityScript.Lang.dll' \) \
+            -delete || true
+
+          find "$PROJECT/Assets" \
+            -type f \
+            \( -name 'Boo.Lang.dll.meta' -o -name 'UnityScript.Lang.dll.meta' \) \
+            -delete || true
+
+          test -s "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll"
+          test -s "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll"
+
+          cp "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll" \
+             "$LEGACY_DIR/Boo.Lang.dll"
+
+          cp "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll" \
+             "$LEGACY_DIR/UnityScript.Lang.dll"
+
+          echo "===== FIX ASSETRIPPER STEAMWORKS EVENT DECOMPILATION ====="
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT"])
+          steam = project / "Assets/Plugins/Assembly-CSharp-firstpass/Steamworks"
+          out = Path(os.environ["OUTPUT"])
+
+          targets = [
+              steam / "Callback.cs",
+              steam / "CallResult.cs",
+          ]
+
+          report = []
+          total_changed = 0
+
+          for p in targets:
+              if not p.exists():
+                  raise SystemExit(f"Required Steamworks source missing: {p}")
+
+              s = p.read_text(encoding="utf-8", errors="replace")
+              old = s
+
+              before_lines = [
+                  line for line in s.splitlines()
+                  if "m_Func" in line and re.search(r"\bevent\b", line)
+              ]
+
+              # AssetRipper can output declarations such as:
+              #   private event ... m_Func = ...
+              # The initializer after m_Func is why v1.2's old regex missed it.
+              # Remove ONLY the `event` keyword from declarations that contain m_Func.
+              lines = []
+              changed_here = 0
+
+              for line in s.splitlines(True):
+                  if "m_Func" in line and re.search(r"\bevent\b", line):
+                      new_line, n = re.subn(r"\bevent\s+", "", line, count=1)
+                      line = new_line
+                      changed_here += n
+                  lines.append(line)
+
+              s = "".join(lines)
+
+              # Fallback for a declaration split across several lines.
+              s, n_multiline = re.subn(
+                  r"\bevent\b(?=[^;{}]{0,500}\bm_Func\b)",
+                  "",
+                  s,
+                  flags=re.S
+              )
+              changed_here += n_multiline
+
+              if s != old:
+                  p.write_text(s, encoding="utf-8")
+                  total_changed += changed_here
+                  report.append(
+                      f"PATCHED :: {p.relative_to(project)} :: removed_event={changed_here}"
+                  )
+              else:
+                  report.append(
+                      f"UNCHANGED :: {p.relative_to(project)}"
+                  )
+
+              after = p.read_text(encoding="utf-8", errors="replace")
+              bad = [
+                  line for line in after.splitlines()
+                  if "m_Func" in line and re.search(r"\bevent\b", line)
+              ]
+
+              report.append("BEFORE_EVENT_LINES=" + str(len(before_lines)))
+              report.append("AFTER_EVENT_LINES=" + str(len(bad)))
+
+              if bad:
+                  report.append("REMAINING:")
+                  report.extend(bad[:30])
+                  (out / "steamworks-v1.3-patch.txt").write_text(
+                      "\n".join(report) + "\n",
+                      encoding="utf-8"
+                  )
+                  raise SystemExit(
+                      f"Steamworks patch failed in {p.name}; event m_Func still remains"
+                  )
+
+          if total_changed < 2:
+              # We expect one m_Func declaration in each of the two files.
+              # Stop NOW, before downloading Unity, if the recovered source shape changed.
+              (out / "steamworks-v1.3-patch.txt").write_text(
+                  "\n".join(report) + "\n",
+                  encoding="utf-8"
+              )
+              raise SystemExit(
+                  "Steamworks preflight changed fewer declarations than expected. "
+                  "Stopping before the slow Unity steps."
+              )
+
+          (out / "steamworks-v1.3-patch.txt").write_text(
+              "\n".join(report) + "\n",
+              encoding="utf-8"
+          )
+
+          print("\n".join(report))
+          PY
+
+          echo "===== FIX DEPTH OF FIELD UNITY 2019 API ====="
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT"])
+          out = Path(os.environ["OUTPUT"])
+          changed = []
+
+          for p in project.rglob("*.cs"):
+              s = p.read_text(encoding="utf-8", errors="replace")
+              old = s
+
+              # Unity 2019.4: use DrawProceduralIndirect, NOT DrawProceduralIndirectNow.
+              s = s.replace(
+                  "Graphics.DrawProceduralIndirectNow(",
+                  "Graphics.DrawProceduralIndirect("
+              )
+
+              if s != old:
+                  p.write_text(s, encoding="utf-8")
+                  changed.append(str(p.relative_to(project)))
+
+          (out / "depthoffield-v1.3-patch.txt").write_text(
+              "\n".join(changed) + ("\n" if changed else ""),
+              encoding="utf-8"
+          )
+
+          print("DepthOfField/API files patched:", len(changed))
+          PY
+
+          echo "===== FAST SOURCE PREFLIGHT — BEFORE UNITY DOWNLOAD ====="
+
+          STEAM_BAD="$(
+            grep -RInE \
+              --include='Callback.cs' \
+              --include='CallResult.cs' \
+              'event[[:space:]].*m_Func' \
+              "$PROJECT/Assets/Plugins/Assembly-CSharp-firstpass/Steamworks" \
+              || true
+          )"
+
+          if [ -n "$STEAM_BAD" ]; then
+            echo "$STEAM_BAD"
+            echo "::error::Steamworks m_Func is still an event. Stopping immediately."
+            exit 1
+          fi
+
+          DEPTH_BAD="$(
+            grep -RIn \
+              --include='*.cs' \
+              'Graphics.DrawProceduralIndirectNow(' \
+              "$PROJECT/Assets" \
+              || true
+          )"
+
+          if [ -n "$DEPTH_BAD" ]; then
+            echo "$DEPTH_BAD"
+            echo "::error::DrawProceduralIndirectNow still exists. Stopping immediately."
+            exit 1
+          fi
+
+          echo "Steamworks source preflight: CLEAN"
+          echo "DepthOfField source preflight: CLEAN"
+          echo "No slow Unity step has started yet."
+
+          {
+            echo "Boo.Lang.dll:"
+            sha256sum "$LEGACY_DIR/Boo.Lang.dll"
+            echo
+            echo "UnityScript.Lang.dll:"
+            sha256sum "$LEGACY_DIR/UnityScript.Lang.dll"
+            echo
+            echo "CharacterMotor Boo references:"
+            grep -RIn \
+              --include='CharacterMotor.cs' \
+              -E 'Boo\.Lang|GenericGenerator|GenericGeneratorEnumerator' \
+              "$PROJECT/Assets/Plugins" \
+              || true
+          } | tee "$OUTPUT/legacy-boo-unityscript-v1.3.txt"
 
       - name: Setup Node 22 and Unity licensing helper
         uses: actions/setup-node@v4
@@ -840,195 +1065,6 @@ jobs:
             process.exit(1);
           });
           NODE
-
-      - name: Install Unity 2017.4.40f1
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$WORK/unity-2017"
-
-          URL="https://download.unity3d.com/download_unity/${MIGRATION_CHANGESET}/LinuxEditorInstaller/Unity-${MIGRATION_UNITY}.tar.xz"
-
-          curl -fL \
-            --retry 5 \
-            --retry-delay 5 \
-            "$URL" \
-            -o "$WORK/Unity-${MIGRATION_UNITY}.tar.xz"
-
-          tar -xJf \
-            "$WORK/Unity-${MIGRATION_UNITY}.tar.xz" \
-            -C "$WORK/unity-2017"
-
-          UNITY2017="$(
-            find "$WORK/unity-2017" \
-              -type f \
-              -path '*/Editor/Unity' \
-              -perm -111 \
-              -print \
-              | head -1
-          )"
-
-          test -n "$UNITY2017"
-
-          echo "UNITY2017=$UNITY2017" >> "$GITHUB_ENV"
-          "$UNITY2017" -version || true
-
-      - name: Unity 2017 compatibility migration
-        shell: bash
-        run: |
-          set +e
-
-          PROJECT="${{ steps.recover.outputs.project }}"
-          export PROJECT
-
-          LOG="$OUTPUT/unity-2017-migration.log"
-
-          rm -rf \
-            "$PROJECT/Library" \
-            "$PROJECT/Temp" \
-            "$PROJECT/obj" \
-            2>/dev/null || true
-
-          timeout 75m \
-            xvfb-run -a \
-            "$UNITY2017" \
-            -batchmode \
-            -nographics \
-            -quit \
-            -projectPath "$PROJECT" \
-            -logFile "$LOG"
-
-          RC=$?
-
-          echo "UNITY2017_EXIT_CODE=$RC" | tee "$OUTPUT/unity-2017-exit-code.txt"
-
-          grep -nE 'error CS[0-9]+' "$LOG" \
-            | tail -250 \
-            | tee "$OUTPUT/unity-2017-compiler-errors.txt" \
-            || true
-
-          tail -350 "$LOG" || true
-
-          set -e
-
-      - name: Repair legacy Boo and Steamworks decompiler output
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PROJECT="${{ steps.recover.outputs.project }}"
-
-          echo "===== RESTORE BOO / UNITYSCRIPT FOR UNITY 2019 ====="
-
-          LEGACY_DIR="$PROJECT/Assets/Plugins/LegacyUnityScript"
-          mkdir -p "$LEGACY_DIR"
-
-          # Unity 2017 includes these legacy assemblies internally, so we add the
-          # APK copies only AFTER the 2017 migration. Unity 2019 no longer ships them.
-          find "$PROJECT/Assets" \
-            -type f \
-            \( -name 'Boo.Lang.dll' -o -name 'UnityScript.Lang.dll' \) \
-            -delete || true
-
-          find "$PROJECT/Assets" \
-            -type f \
-            \( -name 'Boo.Lang.dll.meta' -o -name 'UnityScript.Lang.dll.meta' \) \
-            -delete || true
-
-          test -s "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll"
-          test -s "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll"
-
-          cp "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll" \
-             "$LEGACY_DIR/Boo.Lang.dll"
-
-          cp "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll" \
-             "$LEGACY_DIR/UnityScript.Lang.dll"
-
-          echo "===== FIX ASSETRIPPER STEAMWORKS EVENT DECOMPILATION ====="
-
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          project = Path(os.environ["PROJECT"])
-          steam = project / "Assets/Plugins/Assembly-CSharp-firstpass/Steamworks"
-          out = Path(os.environ["OUTPUT"])
-
-          targets = [
-              steam / "Callback.cs",
-              steam / "CallResult.cs",
-          ]
-
-          report = []
-
-          for p in targets:
-              if not p.exists():
-                  report.append(f"MISSING :: {p}")
-                  continue
-
-              s = p.read_text(encoding="utf-8", errors="replace")
-              old = s
-
-              # AssetRipper incorrectly emitted callback storage as C# events.
-              # Steamworks.NET uses these internally as ordinary delegate fields,
-              # so direct null checks/invocation are legal only when `event`
-              # is removed.
-              s, n = re.subn(
-                  r'(\b(?:public|private|protected|internal)\s+)event(\s+[^;\n]+\bm_Func\s*;)',
-                  r'\1\2',
-                  s
-              )
-
-              # Fallback for unusual modifier order.
-              s, n2 = re.subn(
-                  r'\bevent(\s+[^;\n]+\bm_Func\s*;)',
-                  r'\1',
-                  s
-              )
-
-              total = n + n2
-
-              if s != old:
-                  p.write_text(s, encoding="utf-8")
-                  report.append(f"PATCHED :: {p.relative_to(project)} :: removed_event={total}")
-              else:
-                  report.append(f"UNCHANGED :: {p.relative_to(project)}")
-
-          # Verify no m_Func event declarations remain in the two problem files.
-          bad = []
-          for p in targets:
-              if p.exists():
-                  s = p.read_text(encoding="utf-8", errors="replace")
-                  if re.search(r'\bevent\s+[^;\n]+\bm_Func\s*;', s):
-                      bad.append(str(p.relative_to(project)))
-
-          (out / "steamworks-v1.2-patch.txt").write_text(
-              "\n".join(report) + "\n",
-              encoding="utf-8"
-          )
-
-          print("\n".join(report))
-
-          if bad:
-              raise SystemExit("Steamworks m_Func event declarations remain: " + ", ".join(bad))
-          PY
-
-          {
-            echo "Boo.Lang.dll:"
-            sha256sum "$LEGACY_DIR/Boo.Lang.dll"
-            echo
-            echo "UnityScript.Lang.dll:"
-            sha256sum "$LEGACY_DIR/UnityScript.Lang.dll"
-            echo
-            echo "CharacterMotor Boo references:"
-            grep -RIn \
-              --include='CharacterMotor.cs' \
-              -E 'Boo\.Lang|GenericGenerator|GenericGeneratorEnumerator' \
-              "$PROJECT/Assets/Plugins" \
-              || true
-          } | tee "$OUTPUT/legacy-boo-unityscript-v1.2.txt"
 
       - name: Prepare Unity 2019 project and iOS repair scripts
         shell: bash
@@ -1910,6 +1946,19 @@ jobs:
 
           echo "Steamworks callback delegate patch: CLEAN"
 
+          echo "===== DEPTH OF FIELD API AUDIT ====="
+
+          if grep -RIn \
+            --include='*.cs' \
+            'Graphics.DrawProceduralIndirectNow(' \
+            "$PROJECT/Assets"
+          then
+            echo "::error::Invalid Unity 2019 DrawProceduralIndirectNow call remains."
+            exit 1
+          fi
+
+          echo "DepthOfField API patch: CLEAN"
+
           echo "===== ANDROIDJAVA REFERENCES ====="
 
           grep -RIn \
@@ -2023,10 +2072,10 @@ jobs:
           tar \
             -C "$(dirname "$XCODE_OUT")" \
             -czf \
-              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Xcode.tar.gz" \
+              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Xcode.tar.gz" \
             "$(basename "$XCODE_OUT")"
 
-          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Xcode.tar.gz"
+          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Xcode.tar.gz"
 
       - name: Collect Unity diagnostics
         if: always()
@@ -2034,7 +2083,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -2042,9 +2091,10 @@ jobs:
           cp "$OUTPUT"/*.txt "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT"/*.log "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT/MSC2021-original-icon.png" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/legacy-boo-unityscript-v1.2.txt" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/original-icon-sha256-v1.2.txt" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/steamworks-v1.2-patch.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/legacy-boo-unityscript-v1.3.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/original-icon-sha256-v1.3.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/steamworks-v1.3-patch.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/depthoffield-v1.3-patch.txt" "$DIAG/" 2>/dev/null || true
 
           if [ -n "${PROJECT:-}" ] && [ -f "$PROJECT/ProjectSettings/ProjectVersion.txt" ]; then
             cp "$PROJECT/ProjectSettings/ProjectVersion.txt" "$DIAG/" || true
@@ -2052,7 +2102,7 @@ jobs:
 
           {
             echo "SOURCE_UNITY=$SOURCE_UNITY"
-            echo "MIGRATION_UNITY=$MIGRATION_UNITY"
+            echo "MIGRATION_UNITY=SKIPPED_DIRECT_2017.3_TO_2019.4"
             echo "BUILD_UNITY=$BUILD_UNITY"
             echo "XCODE_READY=${{ steps.detect_xcode.outputs.ready }}"
             echo "RECOVER_OUTCOME=${{ steps.recover.outcome }}"
@@ -2067,15 +2117,15 @@ jobs:
             2>/dev/null || true
 
           zip -qr \
-            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Diagnostics.zip" \
+            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Diagnostics.zip" \
             "$DIAG"
 
       - name: Upload Unity diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.2-Diagnostics
-          path: MSC2021-Mobile-iOS-v1.2-Diagnostics.zip
+          name: MSC2021-Mobile-iOS-v1.3-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.3-Diagnostics.zip
           compression-level: 0
           if-no-files-found: warn
 
@@ -2083,8 +2133,8 @@ jobs:
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.2-Xcode
-          path: MSC2021-Mobile-iOS-v1.2-Xcode.tar.gz
+          name: MSC2021-Mobile-iOS-v1.3-Xcode
+          path: MSC2021-Mobile-iOS-v1.3-Xcode.tar.gz
           compression-level: 0
           if-no-files-found: error
 
@@ -2093,7 +2143,7 @@ jobs:
         shell: bash
         run: |
           echo "::error::Unity did not generate the MSC2021 iOS Xcode project."
-          echo "Download MSC2021-Mobile-iOS-v1.2-Diagnostics and send it here."
+          echo "Download MSC2021-Mobile-iOS-v1.3-Diagnostics and send it here."
           exit 1
 
   xcode_build:
@@ -2107,7 +2157,7 @@ jobs:
       - name: Download Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.2-Xcode
+          name: MSC2021-Mobile-iOS-v1.3-Xcode
           path: xcode-artifact
 
       - name: Extract Xcode project
@@ -2345,15 +2395,15 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "MSC2021-Mobile-iOS-v1.2-unsigned.ipa"
+            "MSC2021-Mobile-iOS-v1.3-unsigned.ipa"
 
-          ls -lh "MSC2021-Mobile-iOS-v1.2-unsigned.ipa"
+          ls -lh "MSC2021-Mobile-iOS-v1.3-unsigned.ipa"
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.2-unsigned-IPA
-          path: MSC2021-Mobile-iOS-v1.2-unsigned.ipa
+          name: MSC2021-Mobile-iOS-v1.3-unsigned-IPA
+          path: MSC2021-Mobile-iOS-v1.3-unsigned.ipa
           compression-level: 0
           if-no-files-found: error
 
@@ -2363,7 +2413,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="MSC2021-Mobile-iOS-v1.2-Xcode-Diagnostics"
+          DIAG="MSC2021-Mobile-iOS-v1.3-Xcode-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -2402,7 +2452,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.2-Xcode-Diagnostics
-          path: MSC2021-Mobile-iOS-v1.2-Xcode-Diagnostics
+          name: MSC2021-Mobile-iOS-v1.3-Xcode-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.3-Xcode-Diagnostics
           compression-level: 0
           if-no-files-found: warn
