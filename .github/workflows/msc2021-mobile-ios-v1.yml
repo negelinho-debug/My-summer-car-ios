@@ -1,4 +1,4 @@
-name: My Summer Car 2021 Mobile iOS - v1.1 Boo Legacy Fix + Original Icon
+name: My Summer Car 2021 Mobile iOS - v1.2 Steamworks Fix + Fail Fast + Original Icon
 
 on:
   workflow_dispatch:
@@ -616,56 +616,10 @@ jobs:
                   print("moved", rel)
           PY
 
-          echo "===== RESTORE ORIGINAL UNITYSCRIPT/BOO COMPATIBILITY DLLS ====="
-
-          LEGACY_DIR="$PROJECT/Assets/Plugins/LegacyUnityScript"
-          mkdir -p "$LEGACY_DIR"
-
-          # AssetRipper's decompiled CharacterMotor.cs still uses
-          # Boo.Lang.CompilerServices.GenericGenerator/GenericGeneratorEnumerator.
-          # Unity 2019 no longer ships Boo/UnityScript, so restore the exact DLLs
-          # from THIS APK instead of trying to rewrite CharacterMotor by hand.
-          find "$PROJECT/Assets" \
-            -type f \
-            \( -name 'Boo.Lang.dll' -o -name 'UnityScript.Lang.dll' \) \
-            -delete || true
-
-          find "$PROJECT/Assets" \
-            -type f \
-            \( -name 'Boo.Lang.dll.meta' -o -name 'UnityScript.Lang.dll.meta' \) \
-            -delete || true
-
-          test -s "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll"
-          test -s "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll"
-
-          cp \
-            "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll" \
-            "$LEGACY_DIR/Boo.Lang.dll"
-
-          cp \
-            "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll" \
-            "$LEGACY_DIR/UnityScript.Lang.dll"
-
-          {
-            echo "Boo.Lang.dll:"
-            sha256sum "$LEGACY_DIR/Boo.Lang.dll"
-            echo
-            echo "UnityScript.Lang.dll:"
-            sha256sum "$LEGACY_DIR/UnityScript.Lang.dll"
-            echo
-            echo "CharacterMotor Boo references:"
-            grep -RIn \
-              --include='CharacterMotor.cs' \
-              -E 'Boo\.Lang|GenericGenerator|GenericGeneratorEnumerator' \
-              "$PROJECT/Assets/Plugins" \
-              || true
-          } | tee "$OUTPUT/legacy-boo-unityscript-v1.1.txt"
-
           mkdir -p \
             "$PROJECT/Assets/MSC2021iOS/Editor"
 
-          # ORIGINAL APK ICON.
-          # This file was extracted directly from MSC2021Mobile.apk above.
+          # ORIGINAL APK ICON: exact app_icon.png extracted from MSC2021Mobile.apk.
           cp \
             "$OUTPUT/MSC2021-original-icon.png" \
             "$PROJECT/Assets/MSC2021iOS/app_icon.png"
@@ -675,7 +629,7 @@ jobs:
             sha256sum "$OUTPUT/MSC2021-original-icon.png"
             echo "Unity project icon copy:"
             sha256sum "$PROJECT/Assets/MSC2021iOS/app_icon.png"
-          } | tee "$OUTPUT/original-icon-sha256-v1.1.txt"
+          } | tee "$OUTPUT/original-icon-sha256-v1.2.txt"
 
           if [ "$(
             sha256sum "$OUTPUT/MSC2021-original-icon.png" | awk '{print $1}'
@@ -949,9 +903,132 @@ jobs:
 
           echo "UNITY2017_EXIT_CODE=$RC" | tee "$OUTPUT/unity-2017-exit-code.txt"
 
+          grep -nE 'error CS[0-9]+' "$LOG" \
+            | tail -250 \
+            | tee "$OUTPUT/unity-2017-compiler-errors.txt" \
+            || true
+
           tail -350 "$LOG" || true
 
           set -e
+
+      - name: Repair legacy Boo and Steamworks decompiler output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.recover.outputs.project }}"
+
+          echo "===== RESTORE BOO / UNITYSCRIPT FOR UNITY 2019 ====="
+
+          LEGACY_DIR="$PROJECT/Assets/Plugins/LegacyUnityScript"
+          mkdir -p "$LEGACY_DIR"
+
+          # Unity 2017 includes these legacy assemblies internally, so we add the
+          # APK copies only AFTER the 2017 migration. Unity 2019 no longer ships them.
+          find "$PROJECT/Assets" \
+            -type f \
+            \( -name 'Boo.Lang.dll' -o -name 'UnityScript.Lang.dll' \) \
+            -delete || true
+
+          find "$PROJECT/Assets" \
+            -type f \
+            \( -name 'Boo.Lang.dll.meta' -o -name 'UnityScript.Lang.dll.meta' \) \
+            -delete || true
+
+          test -s "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll"
+          test -s "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll"
+
+          cp "$APKROOT/assets/bin/Data/Managed/Boo.Lang.dll" \
+             "$LEGACY_DIR/Boo.Lang.dll"
+
+          cp "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll" \
+             "$LEGACY_DIR/UnityScript.Lang.dll"
+
+          echo "===== FIX ASSETRIPPER STEAMWORKS EVENT DECOMPILATION ====="
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT"])
+          steam = project / "Assets/Plugins/Assembly-CSharp-firstpass/Steamworks"
+          out = Path(os.environ["OUTPUT"])
+
+          targets = [
+              steam / "Callback.cs",
+              steam / "CallResult.cs",
+          ]
+
+          report = []
+
+          for p in targets:
+              if not p.exists():
+                  report.append(f"MISSING :: {p}")
+                  continue
+
+              s = p.read_text(encoding="utf-8", errors="replace")
+              old = s
+
+              # AssetRipper incorrectly emitted callback storage as C# events.
+              # Steamworks.NET uses these internally as ordinary delegate fields,
+              # so direct null checks/invocation are legal only when `event`
+              # is removed.
+              s, n = re.subn(
+                  r'(\b(?:public|private|protected|internal)\s+)event(\s+[^;\n]+\bm_Func\s*;)',
+                  r'\1\2',
+                  s
+              )
+
+              # Fallback for unusual modifier order.
+              s, n2 = re.subn(
+                  r'\bevent(\s+[^;\n]+\bm_Func\s*;)',
+                  r'\1',
+                  s
+              )
+
+              total = n + n2
+
+              if s != old:
+                  p.write_text(s, encoding="utf-8")
+                  report.append(f"PATCHED :: {p.relative_to(project)} :: removed_event={total}")
+              else:
+                  report.append(f"UNCHANGED :: {p.relative_to(project)}")
+
+          # Verify no m_Func event declarations remain in the two problem files.
+          bad = []
+          for p in targets:
+              if p.exists():
+                  s = p.read_text(encoding="utf-8", errors="replace")
+                  if re.search(r'\bevent\s+[^;\n]+\bm_Func\s*;', s):
+                      bad.append(str(p.relative_to(project)))
+
+          (out / "steamworks-v1.2-patch.txt").write_text(
+              "\n".join(report) + "\n",
+              encoding="utf-8"
+          )
+
+          print("\n".join(report))
+
+          if bad:
+              raise SystemExit("Steamworks m_Func event declarations remain: " + ", ".join(bad))
+          PY
+
+          {
+            echo "Boo.Lang.dll:"
+            sha256sum "$LEGACY_DIR/Boo.Lang.dll"
+            echo
+            echo "UnityScript.Lang.dll:"
+            sha256sum "$LEGACY_DIR/UnityScript.Lang.dll"
+            echo
+            echo "CharacterMotor Boo references:"
+            grep -RIn \
+              --include='CharacterMotor.cs' \
+              -E 'Boo\.Lang|GenericGenerator|GenericGeneratorEnumerator' \
+              "$PROJECT/Assets/Plugins" \
+              || true
+          } | tee "$OUTPUT/legacy-boo-unityscript-v1.2.txt"
 
       - name: Prepare Unity 2019 project and iOS repair scripts
         shell: bash
@@ -1753,7 +1830,22 @@ jobs:
             > "$OUTPUT/unity-2019-warmup-important-errors.txt" \
             || true
 
+          CS_COUNT="$(
+            grep -cE 'error CS[0-9]+' "$LOG" 2>/dev/null || true
+          )"
+
+          echo "UNITY2019_WARMUP_CS_ERRORS=$CS_COUNT" \
+            | tee "$OUTPUT/unity-2019-warmup-cs-count.txt"
+
           set -e
+
+          if [ "$CS_COUNT" -gt 0 ] || [ "$RC" -ne 0 ]; then
+            echo "::error::Unity 2019 warm-up has compiler/import errors. STOPPING BEFORE THE SLOW XCODE EXPORT."
+            cat "$OUTPUT/unity-2019-warmup-important-errors.txt" || true
+            exit 1
+          fi
+
+          echo "Warm-up compile is clean. Continuing to iOS export."
 
       - name: Final compile audit
         shell: bash
@@ -1803,6 +1895,20 @@ jobs:
             "$PROJECT/Assets" \
             | tee "$OUTPUT/remaining-camera-hdr.txt" \
             || true
+
+          echo "===== STEAMWORKS CALLBACK PATCH AUDIT ====="
+
+          if grep -RIn \
+            --include='Callback.cs' \
+            --include='CallResult.cs' \
+            -E '\bevent[[:space:]].*\bm_Func[[:space:]]*;' \
+            "$PROJECT/Assets/Plugins/Assembly-CSharp-firstpass/Steamworks"
+          then
+            echo "::error::Broken AssetRipper Steamworks m_Func event still exists."
+            exit 1
+          fi
+
+          echo "Steamworks callback delegate patch: CLEAN"
 
           echo "===== ANDROIDJAVA REFERENCES ====="
 
@@ -1917,10 +2023,10 @@ jobs:
           tar \
             -C "$(dirname "$XCODE_OUT")" \
             -czf \
-              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Xcode.tar.gz" \
+              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Xcode.tar.gz" \
             "$(basename "$XCODE_OUT")"
 
-          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Xcode.tar.gz"
+          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Xcode.tar.gz"
 
       - name: Collect Unity diagnostics
         if: always()
@@ -1928,7 +2034,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -1936,8 +2042,9 @@ jobs:
           cp "$OUTPUT"/*.txt "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT"/*.log "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT/MSC2021-original-icon.png" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/legacy-boo-unityscript-v1.1.txt" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/original-icon-sha256-v1.1.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/legacy-boo-unityscript-v1.2.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/original-icon-sha256-v1.2.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/steamworks-v1.2-patch.txt" "$DIAG/" 2>/dev/null || true
 
           if [ -n "${PROJECT:-}" ] && [ -f "$PROJECT/ProjectSettings/ProjectVersion.txt" ]; then
             cp "$PROJECT/ProjectSettings/ProjectVersion.txt" "$DIAG/" || true
@@ -1960,15 +2067,15 @@ jobs:
             2>/dev/null || true
 
           zip -qr \
-            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.1-Diagnostics.zip" \
+            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.2-Diagnostics.zip" \
             "$DIAG"
 
       - name: Upload Unity diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.1-Diagnostics
-          path: MSC2021-Mobile-iOS-v1.1-Diagnostics.zip
+          name: MSC2021-Mobile-iOS-v1.2-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.2-Diagnostics.zip
           compression-level: 0
           if-no-files-found: warn
 
@@ -1976,8 +2083,8 @@ jobs:
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.1-Xcode
-          path: MSC2021-Mobile-iOS-v1.1-Xcode.tar.gz
+          name: MSC2021-Mobile-iOS-v1.2-Xcode
+          path: MSC2021-Mobile-iOS-v1.2-Xcode.tar.gz
           compression-level: 0
           if-no-files-found: error
 
@@ -1986,7 +2093,7 @@ jobs:
         shell: bash
         run: |
           echo "::error::Unity did not generate the MSC2021 iOS Xcode project."
-          echo "Download MSC2021-Mobile-iOS-v1.1-Diagnostics and send it here."
+          echo "Download MSC2021-Mobile-iOS-v1.2-Diagnostics and send it here."
           exit 1
 
   xcode_build:
@@ -2000,7 +2107,7 @@ jobs:
       - name: Download Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.1-Xcode
+          name: MSC2021-Mobile-iOS-v1.2-Xcode
           path: xcode-artifact
 
       - name: Extract Xcode project
@@ -2238,15 +2345,15 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "MSC2021-Mobile-iOS-v1.1-unsigned.ipa"
+            "MSC2021-Mobile-iOS-v1.2-unsigned.ipa"
 
-          ls -lh "MSC2021-Mobile-iOS-v1.1-unsigned.ipa"
+          ls -lh "MSC2021-Mobile-iOS-v1.2-unsigned.ipa"
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.1-unsigned-IPA
-          path: MSC2021-Mobile-iOS-v1.1-unsigned.ipa
+          name: MSC2021-Mobile-iOS-v1.2-unsigned-IPA
+          path: MSC2021-Mobile-iOS-v1.2-unsigned.ipa
           compression-level: 0
           if-no-files-found: error
 
@@ -2256,7 +2363,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="MSC2021-Mobile-iOS-v1.1-Xcode-Diagnostics"
+          DIAG="MSC2021-Mobile-iOS-v1.2-Xcode-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -2295,7 +2402,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.1-Xcode-Diagnostics
-          path: MSC2021-Mobile-iOS-v1.1-Xcode-Diagnostics
+          name: MSC2021-Mobile-iOS-v1.2-Xcode-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.2-Xcode-Diagnostics
           compression-level: 0
           if-no-files-found: warn
