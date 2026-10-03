@@ -1,4 +1,4 @@
-name: My Summer Car 2021 Mobile iOS - v1.3 Fast Preflight + Steamworks + DepthOfField Fix
+name: My Summer Car 2021 Mobile iOS - v1.4 Steamworks Accessor-to-Delegate Fix
 
 on:
   workflow_dispatch:
@@ -629,7 +629,7 @@ jobs:
             sha256sum "$OUTPUT/MSC2021-original-icon.png"
             echo "Unity project icon copy:"
             sha256sum "$PROJECT/Assets/MSC2021iOS/app_icon.png"
-          } | tee "$OUTPUT/original-icon-sha256-v1.3.txt"
+          } | tee "$OUTPUT/original-icon-sha256-v1.4.txt"
 
           if [ "$(
             sha256sum "$OUTPUT/MSC2021-original-icon.png" | awk '{print $1}'
@@ -761,9 +761,9 @@ jobs:
           cp "$APKROOT/assets/bin/Data/Managed/UnityScript.Lang.dll" \
              "$LEGACY_DIR/UnityScript.Lang.dll"
 
-          echo "===== FIX ASSETRIPPER STEAMWORKS EVENT DECOMPILATION ====="
+          echo "===== FIX ASSETRIPPER STEAMWORKS CUSTOM EVENT ACCESSORS ====="
 
-          python3 - <<'PY'
+          python3 - <<'PY2'
           import os
           import re
           from pathlib import Path
@@ -778,95 +778,131 @@ jobs:
           ]
 
           report = []
-          total_changed = 0
+          total_replaced = 0
+
+          header_re = re.compile(
+              r'(?m)^(?P<indent>[ \\t]*)'
+              r'(?P<mods>(?:(?:public|private|protected|internal|static|new|unsafe)\\s+)*)'
+              r'event\\s+'
+              r'(?P<dtype>[A-Za-z0-9_<>,\\.\\[\\]\\s]+?)'
+              r'\\s+m_Func\\s*'
+              r'(?P<brace>\\{)'
+          )
 
           for p in targets:
               if not p.exists():
                   raise SystemExit(f"Required Steamworks source missing: {p}")
 
               s = p.read_text(encoding="utf-8", errors="replace")
-              old = s
+              original = s
+              file_replaced = 0
+              search_from = 0
 
-              before_lines = [
-                  line for line in s.splitlines()
-                  if "m_Func" in line and re.search(r"\bevent\b", line)
-              ]
+              while True:
+                  m = header_re.search(s, search_from)
+                  if not m:
+                      break
 
-              # AssetRipper can output declarations such as:
-              #   private event ... m_Func = ...
-              # The initializer after m_Func is why v1.2's old regex missed it.
-              # Remove ONLY the `event` keyword from declarations that contain m_Func.
-              lines = []
-              changed_here = 0
+                  open_pos = m.start("brace")
+                  depth = 0
+                  close_pos = None
+                  i = open_pos
+                  in_string = False
+                  in_char = False
+                  escape = False
 
-              for line in s.splitlines(True):
-                  if "m_Func" in line and re.search(r"\bevent\b", line):
-                      new_line, n = re.subn(r"\bevent\s+", "", line, count=1)
-                      line = new_line
-                      changed_here += n
-                  lines.append(line)
+                  while i < len(s):
+                      ch = s[i]
+                      if escape:
+                          escape = False
+                          i += 1
+                          continue
+                      if (in_string or in_char) and ch == '\\\\':
+                          escape = True
+                          i += 1
+                          continue
+                      if not in_char and ch == '"':
+                          in_string = not in_string
+                          i += 1
+                          continue
+                      if not in_string and ch == "'":
+                          in_char = not in_char
+                          i += 1
+                          continue
+                      if not in_string and not in_char:
+                          if ch == '{':
+                              depth += 1
+                          elif ch == '}':
+                              depth -= 1
+                              if depth == 0:
+                                  close_pos = i
+                                  break
+                      i += 1
 
-              s = "".join(lines)
+                  if close_pos is None:
+                      raise SystemExit(f"Could not find closing brace for m_Func event in {p.name}")
 
-              # Fallback for a declaration split across several lines.
-              s, n_multiline = re.subn(
-                  r"\bevent\b(?=[^;{}]{0,500}\bm_Func\b)",
-                  "",
-                  s,
-                  flags=re.S
-              )
-              changed_here += n_multiline
+                  indent = m.group("indent")
+                  mods = m.group("mods") or ""
+                  dtype = " ".join(m.group("dtype").split())
+                  replacement = f"{indent}{mods}{dtype} m_Func;"
+                  before = s[m.start():close_pos + 1]
+                  report.append(f"PATCHED_BLOCK :: {p.relative_to(project)} :: {dtype} m_Func :: bytes={len(before)}")
+                  s = s[:m.start()] + replacement + s[close_pos + 1:]
+                  file_replaced += 1
+                  total_replaced += 1
+                  search_from = m.start() + len(replacement)
 
-              if s != old:
+              if s != original:
                   p.write_text(s, encoding="utf-8")
-                  total_changed += changed_here
-                  report.append(
-                      f"PATCHED :: {p.relative_to(project)} :: removed_event={changed_here}"
-                  )
-              else:
-                  report.append(
-                      f"UNCHANGED :: {p.relative_to(project)}"
-                  )
 
               after = p.read_text(encoding="utf-8", errors="replace")
-              bad = [
-                  line for line in after.splitlines()
-                  if "m_Func" in line and re.search(r"\bevent\b", line)
-              ]
+              if re.search(r'\\bevent\\s+[^;\\n{]*\\bm_Func\\b', after):
+                  raise SystemExit(f"m_Func is still declared as event in {p.name}")
 
-              report.append("BEFORE_EVENT_LINES=" + str(len(before_lines)))
-              report.append("AFTER_EVENT_LINES=" + str(len(bad)))
-
-              if bad:
-                  report.append("REMAINING:")
-                  report.extend(bad[:30])
-                  (out / "steamworks-v1.3-patch.txt").write_text(
-                      "\n".join(report) + "\n",
-                      encoding="utf-8"
-                  )
-                  raise SystemExit(
-                      f"Steamworks patch failed in {p.name}; event m_Func still remains"
-                  )
-
-          if total_changed < 2:
-              # We expect one m_Func declaration in each of the two files.
-              # Stop NOW, before downloading Unity, if the recovered source shape changed.
-              (out / "steamworks-v1.3-patch.txt").write_text(
-                  "\n".join(report) + "\n",
-                  encoding="utf-8"
+              field_ok = re.search(
+                  r'(?m)^[ \\t]*(?:(?:public|private|protected|internal|static|new|unsafe)\\s+)*'
+                  r'[A-Za-z0-9_<>,\\.\\[\\]\\s]+?\\s+m_Func\\s*;',
+                  after
               )
-              raise SystemExit(
-                  "Steamworks preflight changed fewer declarations than expected. "
-                  "Stopping before the slow Unity steps."
-              )
+              if not field_ok:
+                  raise SystemExit(f"m_Func delegate field was not found after patch in {p.name}")
 
-          (out / "steamworks-v1.3-patch.txt").write_text(
-              "\n".join(report) + "\n",
-              encoding="utf-8"
-          )
+              if re.search(r'\\bm_Func\\s*\\{[\\s\\S]{0,4000}\\b(?:add|remove)\\b', after):
+                  raise SystemExit(f"m_Func still has add/remove accessor block in {p.name}")
 
-          print("\n".join(report))
-          PY
+              report.append(f"FILE_OK :: {p.relative_to(project)} :: replaced_blocks={file_replaced}")
+
+          if total_replaced != 2:
+              (out / "steamworks-v1.4-patch.txt").write_text("\\n".join(report) + "\\n", encoding="utf-8")
+              raise SystemExit(f"Expected exactly 2 Steamworks m_Func blocks, replaced {total_replaced}. Stopping before Unity download.")
+
+          (out / "steamworks-v1.4-patch.txt").write_text("\\n".join(report) + "\\n", encoding="utf-8")
+          print("\\n".join(report))
+          print("Steamworks accessor-to-delegate conversion: CLEAN")
+          PY2
+
+          echo "===== FAST STEAMWORKS SYNTAX PREFLIGHT ====="
+
+          for FILE in \
+            "$PROJECT/Assets/Plugins/Assembly-CSharp-firstpass/Steamworks/Callback.cs" \
+            "$PROJECT/Assets/Plugins/Assembly-CSharp-firstpass/Steamworks/CallResult.cs"
+          do
+            echo "--- $FILE"
+            grep -n -A 3 -B 3 'm_Func' "$FILE" | head -120 || true
+          done
+
+          if grep -RInE \
+            --include='Callback.cs' \
+            --include='CallResult.cs' \
+            'event[[:space:]].*m_Func|m_Func[[:space:]]*\\{' \
+            "$PROJECT/Assets/Plugins/Assembly-CSharp-firstpass/Steamworks"
+          then
+            echo "::error::Broken Steamworks m_Func accessor shape still exists."
+            exit 1
+          fi
+
+          echo "Steamworks v1.4 static syntax preflight: CLEAN"
 
           echo "===== FIX DEPTH OF FIELD UNITY 2019 API ====="
 
@@ -892,7 +928,7 @@ jobs:
                   p.write_text(s, encoding="utf-8")
                   changed.append(str(p.relative_to(project)))
 
-          (out / "depthoffield-v1.3-patch.txt").write_text(
+          (out / "depthoffield-v1.4-patch.txt").write_text(
               "\n".join(changed) + ("\n" if changed else ""),
               encoding="utf-8"
           )
@@ -906,14 +942,14 @@ jobs:
             grep -RInE \
               --include='Callback.cs' \
               --include='CallResult.cs' \
-              'event[[:space:]].*m_Func' \
+              'event[[:space:]].*m_Func|m_Func[[:space:]]*\\{' \
               "$PROJECT/Assets/Plugins/Assembly-CSharp-firstpass/Steamworks" \
               || true
           )"
 
           if [ -n "$STEAM_BAD" ]; then
             echo "$STEAM_BAD"
-            echo "::error::Steamworks m_Func is still an event. Stopping immediately."
+            echo "::error::Steamworks m_Func still has an event/accessor shape. Stopping immediately."
             exit 1
           fi
 
@@ -948,7 +984,7 @@ jobs:
               -E 'Boo\.Lang|GenericGenerator|GenericGeneratorEnumerator' \
               "$PROJECT/Assets/Plugins" \
               || true
-          } | tee "$OUTPUT/legacy-boo-unityscript-v1.3.txt"
+          } | tee "$OUTPUT/legacy-boo-unityscript-v1.4.txt"
 
       - name: Setup Node 22 and Unity licensing helper
         uses: actions/setup-node@v4
@@ -1934,17 +1970,17 @@ jobs:
 
           echo "===== STEAMWORKS CALLBACK PATCH AUDIT ====="
 
-          if grep -RIn \
+          if grep -RInE \
             --include='Callback.cs' \
             --include='CallResult.cs' \
-            -E '\bevent[[:space:]].*\bm_Func[[:space:]]*;' \
+            'event[[:space:]].*m_Func|m_Func[[:space:]]*\\{' \
             "$PROJECT/Assets/Plugins/Assembly-CSharp-firstpass/Steamworks"
           then
-            echo "::error::Broken AssetRipper Steamworks m_Func event still exists."
+            echo "::error::Broken AssetRipper Steamworks m_Func event/accessor still exists."
             exit 1
           fi
 
-          echo "Steamworks callback delegate patch: CLEAN"
+          echo "Steamworks accessor-to-delegate patch: CLEAN"
 
           echo "===== DEPTH OF FIELD API AUDIT ====="
 
@@ -2072,10 +2108,10 @@ jobs:
           tar \
             -C "$(dirname "$XCODE_OUT")" \
             -czf \
-              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Xcode.tar.gz" \
+              "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.4-Xcode.tar.gz" \
             "$(basename "$XCODE_OUT")"
 
-          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Xcode.tar.gz"
+          ls -lh "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.4-Xcode.tar.gz"
 
       - name: Collect Unity diagnostics
         if: always()
@@ -2083,7 +2119,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.4-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -2091,10 +2127,10 @@ jobs:
           cp "$OUTPUT"/*.txt "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT"/*.log "$DIAG/" 2>/dev/null || true
           cp "$OUTPUT/MSC2021-original-icon.png" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/legacy-boo-unityscript-v1.3.txt" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/original-icon-sha256-v1.3.txt" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/steamworks-v1.3-patch.txt" "$DIAG/" 2>/dev/null || true
-          cp "$OUTPUT/depthoffield-v1.3-patch.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/legacy-boo-unityscript-v1.4.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/original-icon-sha256-v1.4.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/steamworks-v1.4-patch.txt" "$DIAG/" 2>/dev/null || true
+          cp "$OUTPUT/depthoffield-v1.4-patch.txt" "$DIAG/" 2>/dev/null || true
 
           if [ -n "${PROJECT:-}" ] && [ -f "$PROJECT/ProjectSettings/ProjectVersion.txt" ]; then
             cp "$PROJECT/ProjectSettings/ProjectVersion.txt" "$DIAG/" || true
@@ -2111,21 +2147,21 @@ jobs:
           } > "$DIAG/summary.txt"
 
           grep -RniE \
-            'error CS[0-9]+|Compilation failed|compiler error|Exception|failed|failure|unsupported|DllNotFoundException|TypeLoadException|MissingReferenceException|BuildFailedException' \
+            'error CS[0-9]+|CS1014|CS0548|Compilation failed|compiler error|Exception|failed|failure|unsupported|DllNotFoundException|TypeLoadException|MissingReferenceException|BuildFailedException' \
             "$DIAG" \
             > "$DIAG/important-errors.txt" \
             2>/dev/null || true
 
           zip -qr \
-            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.3-Diagnostics.zip" \
+            "$GITHUB_WORKSPACE/MSC2021-Mobile-iOS-v1.4-Diagnostics.zip" \
             "$DIAG"
 
       - name: Upload Unity diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.3-Diagnostics
-          path: MSC2021-Mobile-iOS-v1.3-Diagnostics.zip
+          name: MSC2021-Mobile-iOS-v1.4-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.4-Diagnostics.zip
           compression-level: 0
           if-no-files-found: warn
 
@@ -2133,8 +2169,8 @@ jobs:
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.3-Xcode
-          path: MSC2021-Mobile-iOS-v1.3-Xcode.tar.gz
+          name: MSC2021-Mobile-iOS-v1.4-Xcode
+          path: MSC2021-Mobile-iOS-v1.4-Xcode.tar.gz
           compression-level: 0
           if-no-files-found: error
 
@@ -2143,7 +2179,7 @@ jobs:
         shell: bash
         run: |
           echo "::error::Unity did not generate the MSC2021 iOS Xcode project."
-          echo "Download MSC2021-Mobile-iOS-v1.3-Diagnostics and send it here."
+          echo "Download MSC2021-Mobile-iOS-v1.4-Diagnostics and send it here."
           exit 1
 
   xcode_build:
@@ -2157,7 +2193,7 @@ jobs:
       - name: Download Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.3-Xcode
+          name: MSC2021-Mobile-iOS-v1.4-Xcode
           path: xcode-artifact
 
       - name: Extract Xcode project
@@ -2395,15 +2431,15 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "MSC2021-Mobile-iOS-v1.3-unsigned.ipa"
+            "MSC2021-Mobile-iOS-v1.4-unsigned.ipa"
 
-          ls -lh "MSC2021-Mobile-iOS-v1.3-unsigned.ipa"
+          ls -lh "MSC2021-Mobile-iOS-v1.4-unsigned.ipa"
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.3-unsigned-IPA
-          path: MSC2021-Mobile-iOS-v1.3-unsigned.ipa
+          name: MSC2021-Mobile-iOS-v1.4-unsigned-IPA
+          path: MSC2021-Mobile-iOS-v1.4-unsigned.ipa
           compression-level: 0
           if-no-files-found: error
 
@@ -2413,7 +2449,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="MSC2021-Mobile-iOS-v1.3-Xcode-Diagnostics"
+          DIAG="MSC2021-Mobile-iOS-v1.4-Xcode-Diagnostics"
 
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
@@ -2452,7 +2488,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: MSC2021-Mobile-iOS-v1.3-Xcode-Diagnostics
-          path: MSC2021-Mobile-iOS-v1.3-Xcode-Diagnostics
+          name: MSC2021-Mobile-iOS-v1.4-Xcode-Diagnostics
+          path: MSC2021-Mobile-iOS-v1.4-Xcode-Diagnostics
           compression-level: 0
           if-no-files-found: warn
